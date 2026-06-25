@@ -1,0 +1,121 @@
+import numpy as np
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Dict, Optional
+
+@dataclass
+class RiskConfig:
+    account_equity: float
+    risk_per_trade: float = 0.02  # 2% per trade
+    max_daily_loss_pct: float = 0.05  # -5% daily stop
+    max_drawdown_pct: float = 0.15  # -15% drawdown stop
+    max_open_trades: int = 3
+    min_reward_risk_ratio: float = 1.5
+    max_trades_per_symbol: int = 2
+    max_volume_per_symbol: float = 0.5
+
+class RiskManager:
+    def __init__(self, config: RiskConfig):
+        self.config = config
+        self.open_trades = []
+        self.daily_pnl = 0.0
+        self.peak_equity = config.account_equity
+        self.session_start_time = datetime.now()
+    
+    def calculate_position_size(self, 
+                               entry_price: float, 
+                               stop_loss_price: float,
+                               historical_trades: Optional[List[Dict]] = None) -> float:
+        """
+        Calculates position size using Base Risk constraint and Kelly Optimization.
+        Constraints ensure it never exceeds a hard 5% maximum absolute risk per trade.
+        """
+        risk_dollars = self.config.account_equity * self.config.risk_per_trade
+        risk_pips = abs(entry_price - stop_loss_price) * 10000  # Convert to pips
+        
+        if risk_pips <= 0:
+            return 0.0
+            
+        # Base position size (assuming 1 lot = 100,000 units, and $10 per pip per lot standard)
+        # 1 standard lot = $10 per pip
+        position_size = risk_dollars / (risk_pips * 10)
+        
+        # Kelly optimization if we have sufficient trade history
+        if historical_trades and len(historical_trades) > 10:
+            wins = len([t for t in historical_trades if t['pnl'] > 0])
+            losses = len(historical_trades) - wins
+            win_rate = wins / len(historical_trades)
+            
+            if losses > 0:
+                avg_win = np.mean([t['pnl'] for t in historical_trades if t['pnl'] > 0])
+                avg_loss = abs(np.mean([t['pnl'] for t in historical_trades if t['pnl'] < 0]))
+                
+                if avg_loss > 0:
+                    # Kelly: f* = (w*b - q) / b, where b is avg_win / avg_loss and q is (1-w)
+                    b = avg_win / avg_loss
+                    kelly_frac = (win_rate * b - (1 - win_rate)) / b
+                    kelly_frac = max(0.5, min(1.5, kelly_frac))  # Conservative: 0.5–1.5x Kelly
+                    position_size *= kelly_frac
+        
+        # Constraint: never risk more than 5% per trade absolute
+        max_risk_dollars = self.config.account_equity * 0.05
+        max_position = max_risk_dollars / (risk_pips * 10)
+        position_size = min(position_size, max_position)
+        
+        return round(max(0.01, position_size), 2)  # Round to 0.01 lots (min 0.01 lot)
+    
+    def can_open_trade(self, symbol: str, volume: float, open_positions: dict) -> dict:
+        """Check if we can open a new trade based on circuit breakers and limits"""
+        # Daily loss limit breaker
+        if self.daily_pnl < -self.config.account_equity * self.config.max_daily_loss_pct:
+            return {'valid': False, 'reason': 'Daily loss limit reached'}
+        
+        # Drawdown limit breaker
+        drawdown = (self.peak_equity - self.config.account_equity) / self.peak_equity
+        if drawdown > self.config.max_drawdown_pct:
+            return {'valid': False, 'reason': 'Max drawdown reached'}
+        
+        # Max global open trades limit
+        if len(open_positions) >= self.config.max_open_trades:
+            return {'valid': False, 'reason': 'Global max open trades reached'}
+            
+        # Symbol specific limits
+        symbol_trades = [pos for pos in open_positions.values() if pos['symbol'] == symbol]
+        if len(symbol_trades) >= self.config.max_trades_per_symbol:
+            return {'valid': False, 'reason': f'Max trades for {symbol} ({self.config.max_trades_per_symbol}) reached'}
+            
+        symbol_volume = sum(pos['volume'] for pos in symbol_trades)
+        if symbol_volume + volume > self.config.max_volume_per_symbol:
+            return {'valid': False, 'reason': f'Max volume for {symbol} ({self.config.max_volume_per_symbol}) exceeded'}
+        
+        return {'valid': True, 'reason': 'OK'}
+    
+    def validate_trade_setup(self, 
+                            entry_price: float, 
+                            stop_loss: float, 
+                            take_profit: float) -> dict:
+        """Check R:R ratio and other trade quality metrics"""
+        risk_pips = abs(entry_price - stop_loss) * 10000
+        reward_pips = abs(take_profit - entry_price) * 10000
+        
+        ratio = round(reward_pips / (risk_pips + 1e-6), 2)
+        
+        return {
+            'valid': ratio >= self.config.min_reward_risk_ratio,
+            'ratio': ratio,
+            'risk_pips': risk_pips,
+            'reward_pips': reward_pips,
+            'reason': f"R:R {ratio:.2f}:1" if ratio >= self.config.min_reward_risk_ratio 
+                     else f"Poor R:R {ratio:.2f}:1 (min {self.config.min_reward_risk_ratio}:1)"
+        }
+    
+    def update_daily_pnl(self, closed_trade_pnl: float):
+        """Track daily P&L and adjust account equity"""
+        self.daily_pnl += closed_trade_pnl
+        self.config.account_equity += closed_trade_pnl
+        self.peak_equity = max(self.peak_equity, self.config.account_equity)
+    
+    def reset_daily_stats(self):
+        """Reset at session end (e.g., 5PM ET)"""
+        self.daily_pnl = 0.0
+        self.session_start_time = datetime.now()
