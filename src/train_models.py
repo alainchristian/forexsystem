@@ -72,11 +72,12 @@ def main():
             'host': os.getenv('FOREX_DB_HOST', 'localhost'),
             'port': os.getenv('FOREX_DB_PORT', '5432')
         },
-        'symbols': ['EURUSDm', 'GBPUSDm', 'USDJPYm']
+        'symbols': []  # populated from ACTIVE_SYMBOLS below
     }
 
     # Initialise the data pipeline (use full config defaults for Redis and MT5)
-    from config.config import REDIS, MT5
+    from config.config import REDIS, MT5, ACTIVE_SYMBOLS
+    config['symbols'] = ACTIVE_SYMBOLS
     pipeline = ForexDataPipeline(
         db_config=config['postgresql'],
         redis_config=REDIS,
@@ -94,7 +95,7 @@ def main():
     # Train on each symbol / timeframe defined in config/config.py
     # ---------------------------------------------------------------------
     from config.config import SYMBOLS
-    for symbol in config['symbols']:
+    for symbol in ACTIVE_SYMBOLS:
         timeframes = SYMBOLS[symbol]['timeframes']
         for tf in timeframes:
             logger.info(f"Fetching historical data for {symbol} {tf}m")

@@ -65,6 +65,7 @@ MT5_CREDENTIALS = {
 # ============================================================================
 
 SYMBOLS = {
+    # --- Majors (USD pairs) ---
     'EURUSDm': {
         'timeframes': [240, 1440],  # 4H, Daily (in minutes)
         'pip_value': 0.0001,
@@ -85,10 +86,81 @@ SYMBOLS = {
         'max_spread': 0.05,
         'min_lot': 0.01,
         'max_lot': 100.0
-    }
+    },
+    'AUDUSDm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0004,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'USDCADm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0004,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'NZDUSDm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0005,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'USDCHFm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0004,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    # --- Major crosses ---
+    'EURGBPm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0005,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'EURJPYm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.01,
+        'max_spread': 0.06,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'GBPJPYm': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.01,
+        'max_spread': 0.08,  # wider spread — volatile cross
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
 }
 
 ACTIVE_SYMBOLS = list(SYMBOLS.keys())
+ALLOWED_SYMBOLS = set(SYMBOLS.keys())
+
+# ============================================================================
+# TRADING BEHAVIOUR CONFIGURATION
+# ============================================================================
+
+# ATR multipliers for SL/TP calculation (widened from 2/3 to reduce premature exits)
+SL_ATR_MULT: float = 3.0
+TP_ATR_MULT: float = 4.5
+
+# Entry slippage applied at order time to align backtest with live conditions
+ENTRY_SLIP_PIPS: float = 0.00015  # 1.5 pips
+
+# Minimum seconds between trades on the same symbol (1 full 4H candle)
+TRADE_COOLDOWN_SECONDS: int = 14_400
+
+# Minimum ensemble confidence required to open a trade
+ENSEMBLE_CONFIDENCE_THRESHOLD: float = 0.65
+
+# UTC hour at which the daily P&L report is sent and stats reset
+DAILY_RESET_HOUR_UTC: int = 20
 
 # ============================================================================
 # DATA PIPELINE CONFIGURATION
@@ -174,11 +246,9 @@ LOGGING = {
             'backupCount': 7
         }
     },
-    'loggers': {
-        'root': {
-            'level': 'DEBUG',
-            'handlers': ['console', 'file']
-        }
+    'root': {
+        'level': 'DEBUG',
+        'handlers': ['console', 'file']
     }
 }
 

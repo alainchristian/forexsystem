@@ -10,6 +10,8 @@ except ImportError:
     MT5_AVAILABLE = False
     print("Warning: MetaTrader5 module not installed or not running on Windows.")
 
+from config.config import TRADE_COOLDOWN_SECONDS, SYMBOLS
+
 class MT5Trader:
     def __init__(self, 
                  account: int,
@@ -24,9 +26,10 @@ class MT5Trader:
         self.telegram = telegram_notifier
         
         self.mt5_initialized = False
-        self.open_positions = {}
+        self.open_positions: Dict = {}
         self.trade_log = []
-        
+        self._last_trade_time: Dict[str, float] = {}
+
         self.logger = logging.getLogger('MT5Trader')
     
     def initialize(self) -> bool:
@@ -61,10 +64,36 @@ class MT5Trader:
                           take_profit: float,
                           confidence: float = 0.0) -> Optional[int]:
         """Submit market order with SL/TP"""
+        if direction not in (1, -1):
+            raise ValueError(f"direction must be 1 or -1, got {direction}")
+        if any(v <= 0 for v in [volume, entry_price, stop_loss, take_profit]):
+            raise ValueError("volume and prices must be positive")
+
         if not self.mt5_initialized:
             self.logger.error("Cannot submit order: MT5 not initialized")
             return None
-            
+
+        # Per-symbol cooldown — block re-entry within one 4H candle
+        now = time.time()
+        if symbol in self._last_trade_time:
+            elapsed = now - self._last_trade_time[symbol]
+            if elapsed < TRADE_COOLDOWN_SECONDS:
+                remaining = int(TRADE_COOLDOWN_SECONDS - elapsed)
+                self.logger.debug(f"Cooldown active for {symbol}: {remaining}s remaining")
+                return None
+
+        # Reject if live spread exceeds the configured maximum for this symbol
+        if symbol in SYMBOLS:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick:
+                live_spread = tick.ask - tick.bid
+                max_spread = SYMBOLS[symbol].get('max_spread', float('inf'))
+                if live_spread > max_spread:
+                    self.logger.warning(
+                        f"Spread too wide for {symbol}: {live_spread:.5f} > max {max_spread:.5f} — order skipped"
+                    )
+                    return None
+
         trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions)
         if not trade_check['valid']:
             # If blocked by max trades limit, try ranked replacement
@@ -155,6 +184,7 @@ class MT5Trader:
                 'confidence': confidence
             }
             
+            self._last_trade_time[symbol] = time.time()
             self.logger.info(f"✅ Order #{order_id} opened: {symbol} {volume}L @ {entry_price}")
             
             dir_str = "BUY" if direction > 0 else "SELL"
@@ -232,6 +262,13 @@ class MT5Trader:
         
         return False
     
+    def get_open_positions(self) -> list:
+        """Return all positions currently open on MT5 for this account."""
+        if not self.mt5_initialized:
+            return []
+        positions = mt5.positions_get()
+        return list(positions) if positions else []
+
     def get_account_info(self) -> Dict:
         """Return current account state"""
         if not self.mt5_initialized:
@@ -250,6 +287,27 @@ class MT5Trader:
             'open_positions': len(self.open_positions)
         }
     
+    def modify_position_sl(self, order_id: int, new_sl: float) -> bool:
+        """Move the stop-loss of an open position to new_sl."""
+        if not self.mt5_initialized or order_id not in self.open_positions:
+            return False
+        pos = self.open_positions[order_id]
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": order_id,
+            "symbol": pos['symbol'],
+            "sl": float(new_sl),
+            "tp": float(pos['tp']),
+        }
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            pos['sl'] = new_sl
+            return True
+        self.logger.warning(
+            f"SL modify failed for #{order_id}: {result.comment if result else 'no result'}"
+        )
+        return False
+
     def shutdown(self):
         """Cleanly disconnect"""
         if self.mt5_initialized:

@@ -3,15 +3,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional
 
+from config.config import SYMBOLS
+
 @dataclass
 class RiskConfig:
     account_equity: float
-    risk_per_trade: float = 0.02  # 2% per trade
+    risk_per_trade: float = 0.01  # 1% per trade (10 symbols × 1% = 10% max exposure)
     max_daily_loss_pct: float = 0.05  # -5% daily stop
     max_drawdown_pct: float = 0.15  # -15% drawdown stop
-    max_open_trades: int = 3
+    max_open_trades: int = 10
     min_reward_risk_ratio: float = 1.5
-    max_trades_per_symbol: int = 2
+    max_trades_per_symbol: int = 1   # 1 per symbol — spread across pairs, don't stack
     max_volume_per_symbol: float = 0.5
 
 class RiskManager:
@@ -22,23 +24,33 @@ class RiskManager:
         self.peak_equity = config.account_equity
         self.session_start_time = datetime.now()
     
-    def calculate_position_size(self, 
-                               entry_price: float, 
+    def calculate_position_size(self,
+                               entry_price: float,
                                stop_loss_price: float,
+                               symbol: Optional[str] = None,
                                historical_trades: Optional[List[Dict]] = None) -> float:
         """
         Calculates position size using Base Risk constraint and Kelly Optimization.
         Constraints ensure it never exceeds a hard 5% maximum absolute risk per trade.
         """
         risk_dollars = self.config.account_equity * self.config.risk_per_trade
-        risk_pips = abs(entry_price - stop_loss_price) * 10000  # Convert to pips
-        
+
+        # Use symbol's pip_value so JPY pairs (pip=0.01) are counted correctly
+        pip_value = SYMBOLS[symbol]['pip_value'] if symbol and symbol in SYMBOLS else 0.0001
+        risk_pips = abs(entry_price - stop_loss_price) / pip_value
+
         if risk_pips <= 0:
             return 0.0
-            
-        # Base position size (assuming 1 lot = 100,000 units, and $10 per pip per lot standard)
-        # 1 standard lot = $10 per pip
-        position_size = risk_dollars / (risk_pips * 10)
+
+        # Dollar value of 1 pip for 1 standard lot (100,000 units)
+        # JPY pairs: quote currency is JPY — convert via current price
+        # All other pairs tracked here are USD-quoted: flat $10/pip/lot
+        if pip_value == 0.01:  # JPY pairs (USDJPY, EURJPY, GBPJPY)
+            dollar_per_pip = (pip_value / entry_price) * 100_000
+        else:
+            dollar_per_pip = 10.0
+
+        position_size = risk_dollars / (risk_pips * dollar_per_pip)
         
         # Kelly optimization if we have sufficient trade history
         if historical_trades and len(historical_trades) > 10:
@@ -61,8 +73,13 @@ class RiskManager:
         max_risk_dollars = self.config.account_equity * 0.05
         max_position = max_risk_dollars / (risk_pips * 10)
         position_size = min(position_size, max_position)
-        
-        return round(max(0.01, position_size), 2)  # Round to 0.01 lots (min 0.01 lot)
+
+        # Clamp to symbol-specific max lot size
+        if symbol and symbol in SYMBOLS:
+            symbol_max = SYMBOLS[symbol].get('max_lot', 100.0)
+            position_size = min(position_size, symbol_max)
+
+        return round(max(0.01, position_size), 2)
     
     def can_open_trade(self, symbol: str, volume: float, open_positions: dict) -> dict:
         """Check if we can open a new trade based on circuit breakers and limits"""
