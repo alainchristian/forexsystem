@@ -13,24 +13,7 @@ import json
 
 from config.config import BACKTEST, LOGS_DIR
 
-# ============================================================================
-# LOGGER SETUP
-# ============================================================================
-
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-fh = logging.FileHandler(LOGS_DIR / 'backtester.log')
-fh.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-fh.setFormatter(formatter)
-ch.setFormatter(formatter)
-
-logger.addHandler(fh)
-logger.addHandler(ch)
 
 # ============================================================================
 # DATA CLASSES
@@ -472,6 +455,28 @@ class Backtester:
         with open(filepath, 'w') as f:
             json.dump(report, f, indent=2, default=str)
         logger.info(f"Exported report to {filepath}")
+
+    def export_equity_curve(self, filepath: str) -> None:
+        """Export equity curve to CSV (trade_num, equity)."""
+        df = pd.DataFrame({
+            'trade_num': range(len(self.equity_curve)),
+            'equity': self.equity_curve,
+        })
+        df.to_csv(filepath, index=False)
+        logger.info(f"Equity curve exported to {filepath}")
+
+    def export_drawdown_curve(self, filepath: str) -> None:
+        """Export drawdown curve to CSV (trade_num, equity, drawdown_pct)."""
+        equity = np.array(self.equity_curve)
+        cum_max = np.maximum.accumulate(equity)
+        drawdown_pct = (equity - cum_max) / (cum_max + 1e-10) * 100
+        df = pd.DataFrame({
+            'trade_num': range(len(equity)),
+            'equity': equity,
+            'drawdown_pct': drawdown_pct,
+        })
+        df.to_csv(filepath, index=False)
+        logger.info(f"Drawdown curve exported to {filepath}")
 
 
 # ============================================================================

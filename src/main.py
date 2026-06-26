@@ -3,6 +3,7 @@ import logging
 import logging.config
 import sys
 import os
+import time as time_module
 from datetime import datetime, time
 from typing import Dict
 from pathlib import Path
@@ -101,9 +102,20 @@ class TradingSystem:
         logger.info("Trading system initialized, entering main loop...")
         await self.telegram.send_alert("🚀 <b>Trading System Started</b>")
 
+        self._last_data_refresh: float = 0.0
+
         while True:
             try:
                 current_time = datetime.utcnow().time()
+
+                # Refresh market data every 5 minutes before processing signals
+                now = time_module.time()
+                if now - self._last_data_refresh >= cfg.DATA_CONFIG['update_interval']:
+                    await asyncio.to_thread(self._refresh_market_data)
+                    self._last_data_refresh = now
+
+                # Drop any positions from memory that MT5 has already closed (SL/TP hit)
+                self._sync_closed_positions()
 
                 for symbol in self.config['symbols']:
                     await self.process_symbol(symbol)
@@ -121,6 +133,16 @@ class TradingSystem:
                 logger.error(f"Main loop exception: {e}", exc_info=True)
                 await self.telegram.send_alert(f"⚠️ Error: {str(e)[:100]}")
                 await asyncio.sleep(60)
+
+    def _sync_closed_positions(self):
+        """Remove positions from open_positions that MT5 has already closed (SL/TP hit)."""
+        if not self.trader.mt5_initialized:
+            return
+        live_tickets = {p.ticket for p in (self.trader.get_open_positions() or [])}
+        stale = [tid for tid in list(self.trader.open_positions) if tid not in live_tickets]
+        for tid in stale:
+            pos = self.trader.open_positions.pop(tid)
+            logger.info(f"Synced: position #{tid} ({pos['symbol']}) closed by MT5 (SL/TP hit)")
 
     async def _reconcile_positions(self):
         """On startup, rebuild open_positions from whatever MT5 has open."""
@@ -146,6 +168,67 @@ class TradingSystem:
             await self.telegram.send_alert(
                 f"🔄 Recovered <b>{recovered}</b> open position(s) from previous session"
             )
+
+    def _refresh_market_data(self):
+        """Fetch the latest candles from MT5 and upsert into the DB.
+
+        Runs every DATA_CONFIG['update_interval'] seconds so the DB never
+        goes stale. Uses the already-initialized MT5 session from self.trader.
+        """
+        if not self.trader.mt5_initialized:
+            return
+
+        try:
+            import MetaTrader5 as mt5
+        except ImportError:
+            return
+
+        tf_map = {240: mt5.TIMEFRAME_H4, 1440: mt5.TIMEFRAME_D1}
+        # Fetch enough bars to cover the ATR(14) window plus a few extras
+        bars_per_tf = {240: 20, 1440: 10}
+
+        upsert_sql = """
+            INSERT INTO {table}
+                (symbol, timeframe, timestamp, open, high, low, close, volume)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, timeframe, timestamp)
+            DO UPDATE SET
+                high   = GREATEST({table}.high,   EXCLUDED.high),
+                low    = LEAST   ({table}.low,    EXCLUDED.low),
+                close  = EXCLUDED.close,
+                volume = EXCLUDED.volume
+        """
+
+        conn = db.get_conn()
+        try:
+            cursor = conn.cursor()
+            updated = 0
+            for symbol in cfg.ACTIVE_SYMBOLS:
+                table = f"ohlcv_{symbol.lower()}"
+                for tf_min, mt5_tf in tf_map.items():
+                    n_bars = bars_per_tf[tf_min]
+                    rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, n_bars)
+                    if rates is None or len(rates) == 0:
+                        continue
+                    records = [
+                        (symbol, tf_min,
+                         datetime.utcfromtimestamp(int(r['time'])),
+                         float(r['open']), float(r['high']),
+                         float(r['low']),  float(r['close']),
+                         int(r['tick_volume']))
+                        for r in rates
+                    ]
+                    from psycopg2.extras import execute_batch
+                    execute_batch(cursor, upsert_sql.format(table=table), records)
+                    updated += len(records)
+
+            conn.commit()
+            logger.debug(f"Market data refreshed: {updated} candle records upserted")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Market data refresh failed: {e}")
+        finally:
+            db.put_conn(conn)
 
     def _fetch_ohlcv(self, symbol: str) -> pd.DataFrame | None:
         """Fetch the 200 most recent 4H candles (timeframe=240)."""
@@ -230,6 +313,18 @@ class TradingSystem:
                 logger.warning(f"Insufficient data for {symbol}")
                 return
 
+            # Refuse to trade on stale data — if the newest 4H candle is older
+            # than 8 hours the SL/TP will be calculated against a stale price
+            # and the actual fill will land far from where we planned.
+            latest_ts = pd.Timestamp(df['timestamp'].iloc[-1])
+            data_age_hours = (datetime.utcnow() - latest_ts).total_seconds() / 3600
+            if data_age_hours > 8:
+                logger.warning(
+                    f"{symbol}: Data too stale ({data_age_hours:.1f}h old, newest candle {latest_ts}) "
+                    f"— skipping trade. Run data ingestion."
+                )
+                return
+
             fe = FeatureEngine(df)
             fe.add_technical_indicators() \
               .add_price_action_features() \
@@ -248,18 +343,39 @@ class TradingSystem:
             # ── Daily trend filter ────────────────────────────────────────────
             # Only trade WITH the Daily SMA(50) direction. This blocks the most
             # common failure mode: entering counter-trend on a 4H bounce.
+            # If daily data is missing, block rather than bypass — unknown trend
+            # is not a reason to trade.
             daily_df = await asyncio.to_thread(self._fetch_daily_closes, symbol)
-            if daily_df is not None and not self._is_trend_aligned(daily_df, signal):
+            if daily_df is None:
+                dir_str = "BUY" if signal > 0 else "SELL"
+                logger.warning(
+                    f"{symbol}: {dir_str} signal blocked — "
+                    f"no Daily data available (run bootstrap to populate timeframe=1440)"
+                )
+                return
+            if not self._is_trend_aligned(daily_df, signal):
                 dir_str = "BUY" if signal > 0 else "SELL"
                 logger.info(
-                    f"{symbol}: {dir_str} signal filtered out — "
-                    f"against Daily SMA(50) trend (close={daily_df['close'].iloc[-1]:.5f})"
+                    f"{symbol}: {dir_str} signal skipped — "
+                    f"counter to Daily SMA(50) trend (close={daily_df['close'].iloc[-1]:.5f})"
                 )
                 return
             # ─────────────────────────────────────────────────────────────────
 
             # ATR-based SL/TP — multipliers are configurable in config.py
             atr = fe.features['atr_14'].iloc[-1]
+
+            # Sanity-check ATR: if it's NaN or unrealistically small the SL will
+            # land right at entry and get hit immediately.  Enforce a per-symbol
+            # floor based on pip_value (minimum 10 pips worth of ATR).
+            pip_value = cfg.SYMBOLS[symbol].get('pip_value', 0.0001)
+            min_atr = pip_value * 10  # 10 pips minimum
+            if pd.isna(atr) or atr < min_atr:
+                logger.warning(
+                    f"{symbol}: ATR invalid ({atr:.6f}) — expected ≥ {min_atr:.5f} "
+                    f"({min_atr/pip_value:.0f} pips). Skipping trade. Check 4H data quality in DB."
+                )
+                return
 
             # Apply entry slippage to align backtest P&L with live conditions
             slip = cfg.ENTRY_SLIP_PIPS
@@ -276,7 +392,9 @@ class TradingSystem:
 
             logger.info(
                 f"{symbol} Signal: {'BUY' if signal > 0 else 'SELL'} "
-                f"| Confidence: {confidence:.2%} | Volume: {volume}"
+                f"| Confidence: {confidence:.2%} | Volume: {volume} "
+                f"| ATR: {atr:.5f} ({atr/pip_value:.1f} pips) "
+                f"| SL: {abs(entry-stop_loss)/pip_value:.1f} pips"
             )
 
             await self.trader.submit_order(

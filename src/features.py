@@ -12,24 +12,7 @@ import traceback
 
 from config.config import FEATURES, LOGS_DIR
 
-# ============================================================================
-# LOGGER SETUP
-# ============================================================================
-
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-fh = logging.FileHandler(LOGS_DIR / 'feature_engineering.log')
-fh.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.WARNING)
-
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-fh.setFormatter(formatter)
-ch.setFormatter(formatter)
-
-logger.addHandler(fh)
-logger.addHandler(ch)
 
 # ============================================================================
 # TECHNICAL INDICATOR FUNCTIONS
@@ -426,31 +409,35 @@ class FeatureEngine:
             logger.error(f"Error adding microstructure features: {e}")
             raise
     
-    def normalize(self, method: str = 'standard') -> 'FeatureEngine':
+    def normalize(self, method: str = 'standard', fit: bool = True) -> 'FeatureEngine':
         """
-        Normalize features for ML models
-        
+        Normalize features for ML models.
+
         Args:
             method: 'standard' (StandardScaler) or 'minmax'
+            fit: If True, fit the scaler on this data (training). If False, only
+                 transform using an already-fitted scaler (walk-forward test folds).
         """
         try:
-            # Remove any all-NaN columns
             features_clean = self.features.dropna(axis=1, how='all')
-            
-            # Fill remaining NaN with forward fill then backward fill
             features_clean = features_clean.ffill().bfill()
-            
+
             if method == 'standard':
-                self.scaler = StandardScaler()
+                if self.scaler is None:
+                    self.scaler = StandardScaler()
+                if fit:
+                    scaled = self.scaler.fit_transform(features_clean)
+                else:
+                    scaled = self.scaler.transform(features_clean)
                 self.features_normalized = pd.DataFrame(
-                    self.scaler.fit_transform(features_clean),
+                    scaled,
                     columns=features_clean.columns,
                     index=features_clean.index
                 )
-            
-            logger.info(f"Normalized {len(features_clean.columns)} features (method: {method})")
+
+            logger.info(f"{'Fit+' if fit else ''}Transformed {len(features_clean.columns)} features (method: {method})")
             return self
-        
+
         except Exception as e:
             logger.error(f"Normalization error: {e}")
             raise

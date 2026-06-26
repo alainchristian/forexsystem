@@ -53,12 +53,14 @@ Equity: ${report.get('equity', 0):.2f}
         self.app.add_handler(CommandHandler("close", self.cmd_close_position))
         self.app.add_handler(CommandHandler("stop", self.cmd_emergency_stop))
         
-        # Start the bot implicitly if needed, or rely on external poll
-        # In a real async loop, we'd use app.start() and app.updater.start_polling()
-        # For this orchestrator, we just need the handlers active.
-        await self.app.start()
-        await self.app.updater.start_polling()
-        self.logger.info("Telegram controls active")
+        try:
+            await asyncio.wait_for(self.app.start(), timeout=15)
+            await asyncio.wait_for(self.app.updater.start_polling(), timeout=15)
+            self.logger.info("Telegram controls active")
+        except asyncio.TimeoutError:
+            self.logger.error("Telegram setup timed out after 15s — running without live controls")
+        except Exception as e:
+            self.logger.error(f"Telegram setup failed: {e}")
 
     async def shutdown(self):
         """Shutdown the Telegram bot cleanly"""
