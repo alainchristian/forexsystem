@@ -32,6 +32,12 @@ from src.models.ensemble import EnsembleStrategy
 logging.config.dictConfig(cfg.LOGGING)
 logger = logging.getLogger('Main')
 
+# Suppress noisy third-party debug output that contains emoji and
+# causes UnicodeEncodeError on Windows cp1252 consoles
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+
 
 class TradingSystem:
     def __init__(self, config: Dict):
@@ -142,7 +148,28 @@ class TradingSystem:
         stale = [tid for tid in list(self.trader.open_positions) if tid not in live_tickets]
         for tid in stale:
             pos = self.trader.open_positions.pop(tid)
-            logger.info(f"Synced: position #{tid} ({pos['symbol']}) closed by MT5 (SL/TP hit)")
+            pnl = self._fetch_closed_pnl(tid)
+            self.risk_mgr.update_daily_pnl(pnl)
+            direction = "BUY" if pos['direction'] > 0 else "SELL"
+            logger.info(
+                f"Synced: position #{tid} ({pos['symbol']} {direction}) "
+                f"closed by MT5 (SL/TP hit) | P&L: ${pnl:+.2f} "
+                f"| Daily P&L: ${self.risk_mgr.daily_pnl:+.2f}"
+            )
+
+    def _fetch_closed_pnl(self, ticket: int) -> float:
+        """Look up the realised profit for a closed position from MT5 deal history."""
+        try:
+            import MetaTrader5 as mt5
+            from datetime import timezone, timedelta
+            since = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=1)
+            deals = mt5.history_deals_get(since, datetime.utcnow().replace(tzinfo=timezone.utc))
+            if deals:
+                total = sum(d.profit for d in deals if d.position_id == ticket)
+                return float(total)
+        except Exception as e:
+            logger.warning(f"Could not fetch P&L for closed position #{ticket}: {e}")
+        return 0.0
 
     async def _reconcile_positions(self):
         """On startup, rebuild open_positions from whatever MT5 has open."""
@@ -336,8 +363,10 @@ class TradingSystem:
 
             signal, confidence = self.ensemble.generate_signal(recent_data, current_price)
 
+            dir_label = {1: "BUY", -1: "SELL", 0: "NEUTRAL"}[signal]
+            logger.info(f"{symbol}: Ensemble -> {dir_label} | confidence: {confidence:.2%}")
+
             if signal == 0:
-                logger.debug(f"{symbol}: No signal (confidence: {confidence:.2%})")
                 return
 
             # ── Daily trend filter ────────────────────────────────────────────

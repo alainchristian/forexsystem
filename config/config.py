@@ -157,7 +157,7 @@ ENTRY_SLIP_PIPS: float = 0.00015  # 1.5 pips
 TRADE_COOLDOWN_SECONDS: int = 14_400
 
 # Minimum ensemble confidence required to open a trade
-ENSEMBLE_CONFIDENCE_THRESHOLD: float = 0.65
+ENSEMBLE_CONFIDENCE_THRESHOLD: float = 0.55
 
 # UTC hour at which the daily P&L report is sent and stats reset
 DAILY_RESET_HOUR_UTC: int = 20
