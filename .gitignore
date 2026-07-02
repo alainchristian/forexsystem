@@ -131,7 +131,9 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# App specific
-logs/
-data/
-models/
+# App specific — anchored to repo root so these don't also match nested
+# dirs of the same name (this used to silently swallow src/models/, which
+# meant the actual model source code was never tracked by git)
+/logs/
+/data/
+/models/
