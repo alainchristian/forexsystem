@@ -1,6 +1,8 @@
 import os
 import logging
+import subprocess
 import numpy as np
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 import pandas as pd
@@ -13,6 +15,7 @@ from src.data_ingestion import ForexDataPipeline
 from src.features import FeatureEngine
 from src.models.lstm_predictor import LSTMPredictor
 from src.models.xgboost_classifier import XGBoostSignal
+from src import model_versioning
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -30,15 +33,16 @@ def get_historical_df(pipeline: ForexDataPipeline, symbol: str, timeframe: int) 
         raise RuntimeError(f"No historical data found for {symbol} {timeframe}m")
     return df
 
-def train_lstm(lstm: LSTMPredictor, df: pd.DataFrame, features_df: pd.DataFrame) -> None:
+def train_lstm(lstm: LSTMPredictor, df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
     """Prepare data and train the LSTM model."""
     (X_train, y_train), (X_test, y_test) = lstm.prepare_data(df, features_df, test_size=0.2)
     logger.info(f"LSTM training shapes - X: {X_train.shape}, y: {y_train.shape}")
     lstm.train(X_train, y_train, epochs=30, batch_size=32)
     loss, mae = lstm.model.evaluate(X_test, y_test, verbose=0)
     logger.info(f"LSTM validation - loss: {loss:.6f}, mae: {mae:.6f}")
+    return {"val_loss": float(loss), "val_mae": float(mae)}
 
-def train_xgboost(xgb: XGBoostSignal, df: pd.DataFrame, features_df: pd.DataFrame) -> None:
+def train_xgboost(xgb: XGBoostSignal, df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
     """Generate labels and train the XGBoost classifier.
 
     threshold_pct=0.002 (0.2%) labels more bars as directional vs the old 0.5%,
@@ -51,6 +55,16 @@ def train_xgboost(xgb: XGBoostSignal, df: pd.DataFrame, features_df: pd.DataFram
     logger.info(f"Label distribution - SELL: {counts[-1]}, FLAT: {counts[0]}, BUY: {counts[1]}")
     metrics = xgb.train(X, labels, cv_folds=3, feature_names=list(features_df.columns))
     logger.info(f"XGBoost CV - accuracy: {metrics['accuracy']:.4f}, precision: {metrics['precision']:.4f}")
+    return metrics
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent.parent, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
 
 def main():
     load_dotenv()
@@ -77,6 +91,10 @@ def main():
     models_dir = Path(__file__).parent.parent / 'models'
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    # Capture whatever's currently live as a rollback point before touching
+    # anything, in case this models/ directory predates versioning.
+    model_versioning.bootstrap_baseline(models_dir)
+
     # -------------------------------------------------------------------------
     # Collect all symbols' data into one combined dataset before training.
     # Previously the loop trained symbol-by-symbol and each iteration overwrote
@@ -84,6 +102,7 @@ def main():
     # -------------------------------------------------------------------------
     all_dfs = []
     all_features = []
+    trained_symbols = []
 
     for symbol in ACTIVE_SYMBOLS:
         timeframes = SYMBOLS[symbol]['timeframes']
@@ -94,6 +113,7 @@ def main():
         except RuntimeError as e:
             logger.warning(str(e))
             continue
+        trained_symbols.append(symbol)
 
         engine = FeatureEngine(df)
         engine.add_technical_indicators() \
@@ -130,16 +150,74 @@ def main():
     xgb_model = XGBoostSignal()
 
     logger.info("Training LSTM on combined dataset (pct_change close)...")
-    train_lstm(lstm, combined_df_pct, combined_features)
+    lstm_metrics = train_lstm(lstm, combined_df_pct, combined_features)
 
     logger.info("Training XGBoost on combined dataset (original close for labels)...")
-    train_xgboost(xgb_model, combined_df_orig, combined_features)
+    xgb_metrics = train_xgboost(xgb_model, combined_df_orig, combined_features)
 
-    lstm.save(str(models_dir))
-    xgb_model.save(str(models_dir))
-    logger.info(f"Models saved to {models_dir}")
+    # -------------------------------------------------------------------------
+    # Save into a new timestamped version, then promote it to the fixed
+    # models/ path main.py loads from. Keeping every version (pruned to the
+    # most recent 8) means a bad training run can be rolled back instead of
+    # silently overwriting the model that was working.
+    # -------------------------------------------------------------------------
+    version_dir = model_versioning.new_version_dir(models_dir)
+    lstm.save(str(version_dir))
+    xgb_model.save(str(version_dir))
+
+    metadata = {
+        "trained_at": datetime.now().isoformat(),
+        "symbols": trained_symbols,
+        "rows": len(combined_df_pct),
+        "lstm": lstm_metrics,
+        "xgboost": xgb_metrics,
+        "git_commit": _git_commit(),
+    }
+    model_versioning.record_version(models_dir, version_dir, metadata)
+    model_versioning.promote(models_dir, version_dir.name)
+    model_versioning.prune(models_dir, keep=8)
+    logger.info(f"Model version {version_dir.name} trained, promoted to live, and saved to {models_dir}")
 
     pipeline.close()
 
+def _print_versions(models_dir: Path) -> None:
+    versions = model_versioning.list_versions(models_dir)
+    if not versions:
+        print("No model versions recorded yet.")
+        return
+    active = model_versioning.active_version(models_dir)
+    for v in versions:
+        marker = " (active)" if v["id"] == active else ""
+        lstm_mae = v.get("lstm", {}).get("val_mae")
+        xgb_acc = v.get("xgboost", {}).get("accuracy")
+        print(
+            f"{v['id']}{marker} — rows={v.get('rows', '?')} "
+            f"lstm_val_mae={lstm_mae} xgboost_accuracy={xgb_acc} "
+            f"git={v.get('git_commit', '?')}"
+        )
+
 if __name__ == '__main__':
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train, list, or roll back the LSTM/XGBoost model ensemble")
+    parser.add_argument('--list-versions', action='store_true', help="List saved model versions and exit")
+    parser.add_argument(
+        '--rollback', nargs='?', const='__previous__', default=None, metavar='VERSION_ID',
+        help="Make VERSION_ID the live model (or the previous version if omitted) and exit, without retraining"
+    )
+    args = parser.parse_args()
+
+    models_dir = Path(__file__).parent.parent / 'models'
+
+    if args.list_versions:
+        _print_versions(models_dir)
+    elif args.rollback is not None:
+        target = None if args.rollback == '__previous__' else args.rollback
+        try:
+            restored = model_versioning.rollback(models_dir, target)
+        except (RuntimeError, ValueError) as e:
+            print(f"Rollback failed: {e}")
+            sys.exit(1)
+        print(f"Rolled back - live models/ is now version {restored}")
+    else:
+        main()
