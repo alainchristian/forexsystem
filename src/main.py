@@ -97,10 +97,12 @@ class TradingSystem:
                 return
         else:
             acc_info = self.trader.get_account_info()
-            if acc_info and 'equity' in acc_info:
+            if acc_info and acc_info.get('equity', 0) > 0:
                 logger.info(f"Syncing Risk Manager with live MT5 equity: ${acc_info['equity']:.2f}")
                 self.risk_mgr.config.account_equity = acc_info['equity']
                 self.risk_mgr.peak_equity = acc_info['equity']
+            else:
+                logger.info(f"Account equity unavailable — using initial_capital: ${self.config['initial_capital']:.2f}")
 
             # Recover any positions that survived a previous crash
             await self._reconcile_positions()
@@ -121,7 +123,10 @@ class TradingSystem:
                     self._last_data_refresh = now
 
                 # Drop any positions from memory that MT5 has already closed (SL/TP hit)
-                self._sync_closed_positions()
+                await self._sync_closed_positions()
+
+                # Retry P&L confirmation for closes where history lookup failed earlier
+                await self.trader.reconcile_pending_pnl()
 
                 for symbol in self.config['symbols']:
                     await self.process_symbol(symbol)
@@ -140,7 +145,7 @@ class TradingSystem:
                 await self.telegram.send_alert(f"⚠️ Error: {str(e)[:100]}")
                 await asyncio.sleep(60)
 
-    def _sync_closed_positions(self):
+    async def _sync_closed_positions(self):
         """Remove positions from open_positions that MT5 has already closed (SL/TP hit)."""
         if not self.trader.mt5_initialized:
             return
@@ -148,28 +153,34 @@ class TradingSystem:
         stale = [tid for tid in list(self.trader.open_positions) if tid not in live_tickets]
         for tid in stale:
             pos = self.trader.open_positions.pop(tid)
-            pnl = self._fetch_closed_pnl(tid)
-            self.risk_mgr.update_daily_pnl(pnl)
+            pnl = await self.trader.get_closed_pnl(tid)
             direction = "BUY" if pos['direction'] > 0 else "SELL"
+
+            if pnl is None:
+                logger.error(
+                    f"Synced: position #{tid} ({pos['symbol']} {direction}) closed by MT5 "
+                    f"but P&L could not be confirmed — daily P&L NOT updated, queuing for reconciliation"
+                )
+                self.trader.queue_pnl_reconciliation(tid, pos['symbol'], "SL/TP hit")
+                await self.telegram.send_alert(
+                    f"⚪ <b>{pos['symbol']}</b> {direction} closed (SL/TP hit)\n"
+                    f"Entry: {pos['entry']:.5f}\n"
+                    f"P&L: unknown — will retry confirmation | Daily P&L: ${self.risk_mgr.daily_pnl:+.2f}"
+                )
+                continue
+
+            self.risk_mgr.update_daily_pnl(pnl)
             logger.info(
                 f"Synced: position #{tid} ({pos['symbol']} {direction}) "
                 f"closed by MT5 (SL/TP hit) | P&L: ${pnl:+.2f} "
                 f"| Daily P&L: ${self.risk_mgr.daily_pnl:+.2f}"
             )
-
-    def _fetch_closed_pnl(self, ticket: int) -> float:
-        """Look up the realised profit for a closed position from MT5 deal history."""
-        try:
-            import MetaTrader5 as mt5
-            from datetime import timezone, timedelta
-            since = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=1)
-            deals = mt5.history_deals_get(since, datetime.utcnow().replace(tzinfo=timezone.utc))
-            if deals:
-                total = sum(d.profit for d in deals if d.position_id == ticket)
-                return float(total)
-        except Exception as e:
-            logger.warning(f"Could not fetch P&L for closed position #{ticket}: {e}")
-        return 0.0
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            await self.telegram.send_alert(
+                f"{emoji} <b>{pos['symbol']}</b> {direction} closed (SL/TP hit)\n"
+                f"Entry: {pos['entry']:.5f}\n"
+                f"P&L: ${pnl:+.2f} | Daily P&L: ${self.risk_mgr.daily_pnl:+.2f}"
+            )
 
     async def _reconcile_positions(self):
         """On startup, rebuild open_positions from whatever MT5 has open."""
@@ -341,11 +352,14 @@ class TradingSystem:
                 return
 
             # Refuse to trade on stale data — if the newest 4H candle is older
-            # than 8 hours the SL/TP will be calculated against a stale price
-            # and the actual fill will land far from where we planned.
+            # than the allowed threshold the SL/TP will be calculated against a
+            # stale price and the actual fill will land far from where we planned.
+            # In mock_mode we relax this to 48h because yfinance forex hourly
+            # data has a ~17h inherent delay; live mode keeps the strict 8h limit.
             latest_ts = pd.Timestamp(df['timestamp'].iloc[-1])
             data_age_hours = (datetime.utcnow() - latest_ts).total_seconds() / 3600
-            if data_age_hours > 8:
+            max_data_age = 48 if self.config.get('mock_mode', False) else 8
+            if data_age_hours > max_data_age:
                 logger.warning(
                     f"{symbol}: Data too stale ({data_age_hours:.1f}h old, newest candle {latest_ts}) "
                     f"— skipping trade. Run data ingestion."
@@ -500,10 +514,14 @@ class TradingSystem:
     async def send_daily_report(self):
         """Send end-of-day metrics via Telegram."""
         trades_today = [t for t in self.trader.trade_log if t['duration'] < 24]
+        # Trades whose P&L couldn't be confirmed (see get_closed_pnl) are excluded
+        # from these stats rather than counted as zero.
+        known_pnl_trades = [t for t in trades_today if t['pnl'] is not None]
+        unknown_pnl_count = len(trades_today) - len(known_pnl_trades)
 
-        wins = len([t for t in trades_today if t['pnl'] > 0])
-        losses = len(trades_today) - wins
-        total_pnl = sum(t['pnl'] for t in trades_today)
+        wins = len([t for t in known_pnl_trades if t['pnl'] > 0])
+        losses = len(known_pnl_trades) - wins
+        total_pnl = sum(t['pnl'] for t in known_pnl_trades)
 
         report = {
             'date': datetime.now().strftime('%Y-%m-%d'),
@@ -511,11 +529,12 @@ class TradingSystem:
             'pnl_pct': (total_pnl / self.risk_mgr.config.account_equity * 100)
                        if self.risk_mgr.config.account_equity else 0,
             'total_trades': len(trades_today),
+            'unknown_pnl_trades': unknown_pnl_count,
             'wins': wins,
             'losses': losses,
-            'win_rate': (wins / len(trades_today)) if trades_today else 0,
-            'max_win': max((t['pnl'] for t in trades_today if t['pnl'] > 0), default=0),
-            'max_loss': min((t['pnl'] for t in trades_today if t['pnl'] < 0), default=0),
+            'win_rate': (wins / len(known_pnl_trades)) if known_pnl_trades else 0,
+            'max_win': max((t['pnl'] for t in known_pnl_trades if t['pnl'] > 0), default=0),
+            'max_loss': min((t['pnl'] for t in known_pnl_trades if t['pnl'] < 0), default=0),
             'equity': self.risk_mgr.config.account_equity,
         }
 
@@ -537,7 +556,7 @@ async def main():
         'max_daily_loss': 0.05,
         'max_open_trades': 10,
         'symbols': cfg.ACTIVE_SYMBOLS,
-        'mock_mode': False,
+        'mock_mode': True,   # bridge mode — no live candle feed; relaxes 48h staleness limit
     }
 
     system = TradingSystem(config)

@@ -66,49 +66,49 @@ MT5_CREDENTIALS = {
 
 SYMBOLS = {
     # --- Majors (USD pairs) ---
-    'EURUSDm': {
+    'EURUSD': {
         'timeframes': [240, 1440],  # 4H, Daily (in minutes)
         'pip_value': 0.0001,
         'max_spread': 0.0003,  # 3 pips typical
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'GBPUSDm': {
+    'GBPUSD': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0004,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'USDJPYm': {
+    'USDJPY': {
         'timeframes': [240, 1440],
         'pip_value': 0.01,
         'max_spread': 0.05,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'AUDUSDm': {
+    'AUDUSD': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0004,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'USDCADm': {
+    'USDCAD': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0004,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'NZDUSDm': {
+    'NZDUSD': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0005,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'USDCHFm': {
+    'USDCHF': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0004,
@@ -116,24 +116,24 @@ SYMBOLS = {
         'max_lot': 100.0
     },
     # --- Major crosses ---
-    'EURGBPm': {
+    'EURGBP': {
         'timeframes': [240, 1440],
         'pip_value': 0.0001,
         'max_spread': 0.0005,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'EURJPYm': {
+    'EURJPY': {
         'timeframes': [240, 1440],
         'pip_value': 0.01,
         'max_spread': 0.06,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
-    'GBPJPYm': {
+    'GBPJPY': {
         'timeframes': [240, 1440],
         'pip_value': 0.01,
-        'max_spread': 0.08,  # wider spread — volatile cross
+        'max_spread': 0.08,
         'min_lot': 0.01,
         'max_lot': 100.0
     },
@@ -161,6 +161,18 @@ ENSEMBLE_CONFIDENCE_THRESHOLD: float = 0.55
 
 # UTC hour at which the daily P&L report is sent and stats reset
 DAILY_RESET_HOUR_UTC: int = 20
+
+# Ranked Replacement guardrails: when max_open_trades is reached, a new
+# signal may bump the lowest-confidence open position only if BOTH hold.
+# Prevents high-frequency churn when confidence hovers near the threshold.
+MIN_REPLACEMENT_HOLD_MINUTES: float = 10.0
+MIN_REPLACEMENT_CONFIDENCE_GAP: float = 0.07
+
+# P&L reconciliation: how often (in reconciliation attempts, ~1 per main-loop
+# tick) to re-alert on Telegram while a closed position's P&L is still
+# unconfirmed. Kept low — a daily-loss breaker silently running on
+# incomplete data is worse than a noisy alert.
+PNL_RECONCILE_ALERT_INTERVAL: int = 5
 
 # ============================================================================
 # DATA PIPELINE CONFIGURATION
@@ -245,6 +257,14 @@ LOGGING = {
             'maxBytes': 10485760,  # 10MB
             'backupCount': 7
         }
+    },
+    'loggers': {
+        'httpx': {'level': 'WARNING'},
+        'httpcore': {'level': 'WARNING'},
+        'hpack': {'level': 'WARNING'},
+        'h2': {'level': 'WARNING'},
+        'telegram': {'level': 'WARNING'},
+        'urllib3': {'level': 'WARNING'},
     },
     'root': {
         'level': 'DEBUG',
