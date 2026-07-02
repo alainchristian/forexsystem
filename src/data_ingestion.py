@@ -39,16 +39,17 @@ from config.config import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-fh = logging.FileHandler(LOGS_DIR / 'data_ingestion.log')
-fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+try:
+    fh = logging.FileHandler(LOGS_DIR / 'data_ingestion.log')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+except OSError:
+    pass
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-fh.setFormatter(formatter)
 ch.setFormatter(formatter)
-
-logger.addHandler(fh)
 logger.addHandler(ch)
 
 # ============================================================================
@@ -133,9 +134,22 @@ class ForexDataPipeline:
             ):
                 logger.error(f"MT5 init failed: {mt5.last_error()}")
                 return False
-            
+
+            # Wait for terminal to finish syncing account data (Netting VPS quirk)
+            acc = None
+            for attempt in range(10):
+                acc = mt5.account_info()
+                if acc is not None:
+                    break
+                logger.info(f"Waiting for account sync... attempt {attempt+1}/10")
+                time.sleep(2)
+            if acc is None:
+                logger.error("MT5 initialized but account_info() never returned data — disconnecting")
+                mt5.shutdown()
+                return False
+
             self.mt5_initialized = True
-            logger.info("MT5 initialized successfully")
+            logger.info(f"MT5 initialized — Balance: {acc.balance:.2f} {acc.currency}")
             return True
         
         except Exception as e:

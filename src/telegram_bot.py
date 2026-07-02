@@ -113,8 +113,7 @@ Open Trades: {account_info.get('open_positions', 0)}
         if not trader:
             return
         
-        # NOTE: close_position is synchronous in the prompt. We could wrap it or just call it.
-        if trader.close_position(order_id, "Manual close via Telegram"):
+        if await trader.close_position(order_id, "Manual close via Telegram"):
             await update.message.reply_text(f"✅ Position #{order_id} closed")
         else:
             await update.message.reply_text(f"❌ Could not close position #{order_id}")
@@ -127,7 +126,7 @@ Open Trades: {account_info.get('open_positions', 0)}
         closed_count = 0
         # Iterate over a list of keys since we modify the dict during iteration
         for order_id in list(trader.open_positions.keys()):
-            if trader.close_position(order_id, "EMERGENCY STOP"):
+            if await trader.close_position(order_id, "EMERGENCY STOP"):
                 closed_count += 1
         
         await update.message.reply_text(f"🛑 EMERGENCY STOP: {closed_count} positions closed")
