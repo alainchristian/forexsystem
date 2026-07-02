@@ -163,10 +163,13 @@ ENSEMBLE_CONFIDENCE_THRESHOLD: float = 0.55
 DAILY_RESET_HOUR_UTC: int = 20
 
 # Ranked Replacement guardrails: when max_open_trades is reached, a new
-# signal may bump the lowest-confidence open position only if BOTH hold.
-# Prevents high-frequency churn when confidence hovers near the threshold.
+# signal may bump the lowest-confidence open position only if ALL hold.
+# Prevents high-frequency churn when confidence hovers near the threshold,
+# and prevents realising a loss on a position purely to make room for a
+# new signal, regardless of how much stronger that signal is.
 MIN_REPLACEMENT_HOLD_MINUTES: float = 10.0
 MIN_REPLACEMENT_CONFIDENCE_GAP: float = 0.07
+MIN_REPLACEMENT_PROFIT: float = 0.0  # position must not be at a loss to be replaced
 
 # P&L reconciliation: how often (in reconciliation attempts, ~1 per main-loop
 # tick) to re-alert on Telegram while a closed position's P&L is still

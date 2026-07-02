@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional
 
-from config.config import SYMBOLS, MIN_REPLACEMENT_HOLD_MINUTES, MIN_REPLACEMENT_CONFIDENCE_GAP
+from config.config import (
+    SYMBOLS, MIN_REPLACEMENT_HOLD_MINUTES, MIN_REPLACEMENT_CONFIDENCE_GAP,
+    MIN_REPLACEMENT_PROFIT,
+)
 
 @dataclass
 class RiskConfig:
@@ -17,6 +20,7 @@ class RiskConfig:
     max_volume_per_symbol: float = 0.5
     min_replacement_hold_minutes: float = MIN_REPLACEMENT_HOLD_MINUTES
     min_replacement_confidence_gap: float = MIN_REPLACEMENT_CONFIDENCE_GAP
+    min_replacement_profit: float = MIN_REPLACEMENT_PROFIT
 
 class RiskManager:
     def __init__(self, config: RiskConfig):

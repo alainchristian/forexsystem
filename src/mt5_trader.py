@@ -194,17 +194,29 @@ class MT5Trader:
                 confidence_gap = confidence - lowest_pos.get("confidence", 1.0)
                 held_long_enough = hold_minutes >= self.risk_mgr.config.min_replacement_hold_minutes
                 confident_enough = confidence_gap >= self.risk_mgr.config.min_replacement_confidence_gap
-                if held_long_enough and confident_enough:
+
+                # Never realise a loss on a position just to make room for a
+                # new signal, no matter how much stronger that signal is. If
+                # the live P&L can't be confirmed, treat it as not-eligible
+                # rather than risk closing a losing position on bad data —
+                # the same class of bug that caused a real -$62.27 loss to
+                # get replaced based on a broken hold-time reading earlier.
+                current_profit = self._get_live_profit(lowest_id)
+                not_losing = current_profit is not None and current_profit >= self.risk_mgr.config.min_replacement_profit
+
+                if held_long_enough and confident_enough and not_losing:
                     self.logger.info(f"Ranked replacement: closing #{lowest_id}")
                     await self.close_position(lowest_id, "Ranked Replacement")
                     trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions)
                     if not trade_check["valid"]:
                         return None
                 else:
+                    profit_str = "unknown" if current_profit is None else f"${current_profit:+.2f}"
                     self.logger.warning(
                         f"Trade blocked: {trade_check['reason']} (replacement rejected for #{lowest_id} — "
                         f"hold {hold_minutes:.1f}/{self.risk_mgr.config.min_replacement_hold_minutes:.1f}min, "
-                        f"confidence gap {confidence_gap:.2f}/{self.risk_mgr.config.min_replacement_confidence_gap:.2f}"
+                        f"confidence gap {confidence_gap:.2f}/{self.risk_mgr.config.min_replacement_confidence_gap:.2f}, "
+                        f"profit {profit_str}"
                         f")"
                     )
                     return None
@@ -320,20 +332,34 @@ class MT5Trader:
                               max_attempts: int = 5, base_delay: float = 0.5) -> Optional[float]:
         """Poll MT5 deal history for the realised profit of a closed position.
 
-        The deal isn't always registered in history_deals_get the instant
-        order_send returns, so this retries with backoff instead of trusting
-        a single lookup. Returns None (never 0.0) when the deal can't be
-        confirmed, so callers don't mistake a lookup failure for an actual
-        zero P&L and corrupt daily P&L tracking with it.
+        The exit deal isn't always registered in history_deals_get the
+        instant order_send returns, so this retries with backoff instead of
+        trusting a single lookup. Returns None (never 0.0) when a genuine
+        close can't be confirmed, so callers don't mistake a lookup failure
+        for an actual zero P&L and corrupt daily P&L tracking with it.
+
+        Specifically waits for an exit-type deal (entry != 0), not just any
+        deal for this position: the entry deal is already in history from
+        when the position opened, so treating "any deal found" as success
+        returned a stale profit=0.0 from the entry alone, before the real
+        closing deal had registered - a live GBPUSD close that actually
+        lost $62.27 got logged (and fed into daily P&L) as $0.00 this way.
+
+        The query window's upper bound is padded several hours past "now"
+        because this account's deal timestamps run consistently ahead of
+        true UTC (observed ~3h) - too tight a bound silently excludes the
+        very-recent deal being polled for.
         """
         if not MT5_AVAILABLE or self._bridge_mode:
             return None
         since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        until = datetime.now(timezone.utc) + timedelta(hours=6)
         for attempt in range(1, max_attempts + 1):
             try:
-                deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
+                deals = mt5.history_deals_get(since, until)
                 matched = [d for d in (deals or []) if d.position_id == ticket]
-                if matched:
+                exit_deals = [d for d in matched if d.entry != 0]
+                if exit_deals:
                     return float(sum(d.profit for d in matched))
             except Exception as e:
                 self.logger.warning(f"P&L lookup failed for #{ticket} (attempt {attempt}/{max_attempts}): {e}")
@@ -513,6 +539,16 @@ class MT5Trader:
             return self._bridge_positions()
         positions = mt5.positions_get()
         return list(positions) if positions else []
+
+    def _get_live_profit(self, ticket: int) -> Optional[float]:
+        """Look up a position's current floating profit/loss from MT5."""
+        try:
+            for pos in self.get_open_positions():
+                if pos.ticket == ticket:
+                    return float(pos.profit)
+        except Exception as e:
+            self.logger.warning(f"Could not fetch live profit for #{ticket}: {e}")
+        return None
 
     def get_account_info(self) -> Dict:
         if not self.mt5_initialized:

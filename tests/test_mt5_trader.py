@@ -122,12 +122,45 @@ def test_get_closed_pnl_retries_until_deal_found(mock_dependencies):
         deal = MagicMock()
         deal.position_id = 777
         deal.profit = 15.25
+        deal.entry = 1  # DEAL_ENTRY_OUT - a real close, not the opening deal
         # Empty on the first two polls, deal appears on the third.
         mock_mt5.history_deals_get.side_effect = [[], [], [deal]]
 
         pnl = asyncio.run(trader.get_closed_pnl(777, max_attempts=5, base_delay=0.01))
 
         assert pnl == 15.25
+        assert mock_mt5.history_deals_get.call_count == 3
+
+
+def test_get_closed_pnl_ignores_entry_deal_and_keeps_waiting_for_exit(mock_dependencies):
+    """Regression test: a position's entry (open) deal is already in MT5
+    history the moment it's closed, well before the closing deal registers.
+    Treating "any matching deal found" as success returned the entry deal's
+    profit=0.0 as if it were the final P&L - in production this logged a
+    real -$62.27 close as $+0.00 and fed that fake zero into daily P&L.
+    get_closed_pnl must keep retrying until an exit-type deal (entry != 0)
+    shows up, not stop at the first (stale) match.
+    """
+    risk_mgr, telegram = mock_dependencies
+
+    with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
+        trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+        trader._bridge_mode = False
+
+        entry_deal = MagicMock(position_id=555, profit=0.0, entry=0)  # DEAL_ENTRY_IN
+        exit_deal = MagicMock(position_id=555, profit=-62.27, entry=1)  # DEAL_ENTRY_OUT
+
+        # First two polls only see the stale entry deal; the real close
+        # shows up on the third poll alongside it.
+        mock_mt5.history_deals_get.side_effect = [
+            [entry_deal],
+            [entry_deal],
+            [entry_deal, exit_deal],
+        ]
+
+        pnl = asyncio.run(trader.get_closed_pnl(555, max_attempts=5, base_delay=0.01))
+
+        assert pnl == -62.27
         assert mock_mt5.history_deals_get.call_count == 3
 
 
@@ -220,7 +253,7 @@ def _trader_with_one_open_position(hold_minutes, low_confidence,
     return trader, lowest_id
 
 
-def _patch_mt5_for_order_submit(mock_mt5, order_id=999):
+def _patch_mt5_for_order_submit(mock_mt5, order_id=999, lowest_id=None, lowest_profit=0.0):
     mock_mt5.symbol_info_tick.return_value = None   # skip spread check
     mock_mt5.account_info.return_value = None        # skip margin check
     mock_mt5.ORDER_TYPE_BUY = 0
@@ -228,6 +261,12 @@ def _patch_mt5_for_order_submit(mock_mt5, order_id=999):
     mock_mt5.TRADE_ACTION_DEAL = 1
     mock_mt5.TRADE_RETCODE_DONE = 10009
     mock_mt5.order_send.return_value = MagicMock(retcode=10009, order=order_id)
+    # get_open_positions() -> mt5.positions_get() backs the live-profit check
+    # the Ranked Replacement guardrail uses.
+    if lowest_id is not None:
+        mock_mt5.positions_get.return_value = [MagicMock(ticket=lowest_id, profit=lowest_profit)]
+    else:
+        mock_mt5.positions_get.return_value = []
 
 
 def test_ranked_replacement_rejected_when_hold_time_too_short():
@@ -237,7 +276,7 @@ def test_ranked_replacement_rejected_when_hold_time_too_short():
         hold_minutes=2.0, low_confidence=0.55, min_hold=10.0, min_gap=0.05
     )
     with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
-        _patch_mt5_for_order_submit(mock_mt5)
+        _patch_mt5_for_order_submit(mock_mt5, lowest_id=lowest_id, lowest_profit=0.0)
         order_id = asyncio.run(trader.submit_order(
             symbol="EURUSD", direction=1, volume=0.1,
             entry_price=1.10, stop_loss=1.09, take_profit=1.12,
@@ -256,7 +295,7 @@ def test_ranked_replacement_rejected_when_confidence_gap_too_small():
         hold_minutes=30.0, low_confidence=0.60, min_hold=10.0, min_gap=0.10
     )
     with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
-        _patch_mt5_for_order_submit(mock_mt5)
+        _patch_mt5_for_order_submit(mock_mt5, lowest_id=lowest_id, lowest_profit=0.0)
         order_id = asyncio.run(trader.submit_order(
             symbol="EURUSD", direction=1, volume=0.1,
             entry_price=1.10, stop_loss=1.09, take_profit=1.12,
@@ -268,14 +307,53 @@ def test_ranked_replacement_rejected_when_confidence_gap_too_small():
     assert lowest_id in trader.open_positions
 
 
-def test_ranked_replacement_accepted_when_both_conditions_pass():
-    """Long enough hold time + large enough confidence gap => replacement
-    proceeds and the new order is submitted."""
+def test_ranked_replacement_rejected_when_position_is_losing():
+    """Long enough hold time + large enough confidence gap still isn't
+    enough — a position currently at a loss must never be closed purely to
+    make room for a new signal."""
     trader, lowest_id = _trader_with_one_open_position(
         hold_minutes=30.0, low_confidence=0.55, min_hold=10.0, min_gap=0.05
     )
     with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
-        _patch_mt5_for_order_submit(mock_mt5, order_id=999)
+        _patch_mt5_for_order_submit(mock_mt5, lowest_id=lowest_id, lowest_profit=-62.27)
+        order_id = asyncio.run(trader.submit_order(
+            symbol="EURUSD", direction=1, volume=0.1,
+            entry_price=1.10, stop_loss=1.09, take_profit=1.12,
+            confidence=0.90,  # gap = 0.35, well above min_gap
+        ))
+
+    assert order_id is None
+    trader.close_position.assert_not_called()
+    assert lowest_id in trader.open_positions
+
+
+def test_ranked_replacement_rejected_when_live_profit_unknown():
+    """If the live P&L lookup fails, fail safe and refuse the replacement -
+    don't risk closing a position based on missing data."""
+    trader, lowest_id = _trader_with_one_open_position(
+        hold_minutes=30.0, low_confidence=0.55, min_hold=10.0, min_gap=0.05
+    )
+    with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
+        _patch_mt5_for_order_submit(mock_mt5, lowest_id=None)  # positions_get() -> [] -> ticket not found
+        order_id = asyncio.run(trader.submit_order(
+            symbol="EURUSD", direction=1, volume=0.1,
+            entry_price=1.10, stop_loss=1.09, take_profit=1.12,
+            confidence=0.90,
+        ))
+
+    assert order_id is None
+    trader.close_position.assert_not_called()
+    assert lowest_id in trader.open_positions
+
+
+def test_ranked_replacement_accepted_when_all_conditions_pass():
+    """Long enough hold time + large enough confidence gap + not currently
+    losing => replacement proceeds and the new order is submitted."""
+    trader, lowest_id = _trader_with_one_open_position(
+        hold_minutes=30.0, low_confidence=0.55, min_hold=10.0, min_gap=0.05
+    )
+    with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
+        _patch_mt5_for_order_submit(mock_mt5, order_id=999, lowest_id=lowest_id, lowest_profit=12.50)
         order_id = asyncio.run(trader.submit_order(
             symbol="EURUSD", direction=1, volume=0.1,
             entry_price=1.10, stop_loss=1.09, take_profit=1.12,
@@ -350,7 +428,7 @@ def test_reconcile_pending_pnl_backfills_once_deal_appears(mock_dependencies):
         })
         trader.queue_pnl_reconciliation(555, "EURUSD", "Manual")
 
-        deal = MagicMock(position_id=555, profit=8.0)
+        deal = MagicMock(position_id=555, profit=8.0, entry=1)
         mock_mt5.history_deals_get.return_value = [deal]
 
         asyncio.run(trader.reconcile_pending_pnl())
