@@ -307,6 +307,30 @@ def test_no_replacement_triggered_when_open_slot_available():
     trader.close_position.assert_not_called()
 
 
+def test_no_replacement_triggered_for_per_symbol_cap():
+    """Per-symbol/volume caps aren't resolved by closing an unrelated
+    position, so Ranked Replacement must only engage for the global
+    portfolio cap - not "Max trades for X" / "Max volume for X" reasons,
+    even when hold time and confidence gap would otherwise clear it."""
+    trader, lowest_id = _trader_with_one_open_position(
+        hold_minutes=30.0, low_confidence=0.55, min_hold=10.0, min_gap=0.05,
+        max_open_trades=5,  # plenty of global room
+    )
+    with patch('src.mt5_trader.MT5_AVAILABLE', True), patch('src.mt5_trader.mt5') as mock_mt5:
+        _patch_mt5_for_order_submit(mock_mt5)
+        # Same symbol as the existing position -> trips max_trades_per_symbol
+        # (1), not the global cap.
+        order_id = asyncio.run(trader.submit_order(
+            symbol="GBPUSD", direction=1, volume=0.1,
+            entry_price=1.10, stop_loss=1.09, take_profit=1.12,
+            confidence=0.90,
+        ))
+
+    assert order_id is None
+    trader.close_position.assert_not_called()
+    assert lowest_id in trader.open_positions
+
+
 # ----------------------------------------------------------------------------
 # reconcile_pending_pnl — backfill job for permanently-failed P&L lookups
 # ----------------------------------------------------------------------------

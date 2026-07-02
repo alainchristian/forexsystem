@@ -195,7 +195,17 @@ class TradingSystem:
                     'entry': pos.price_open,
                     'sl': pos.sl,
                     'tp': pos.tp,
-                    'opened_at': datetime.fromtimestamp(pos.time),
+                    # MT5's pos.time is broker-server time, not true UTC or
+                    # local time, so fromtimestamp(pos.time) produced wildly
+                    # wrong (sometimes future-dated) opened_at values -
+                    # negative hold times in the Ranked Replacement guardrail
+                    # and corrupted trade-duration numbers in daily reports.
+                    # Use the reconciliation moment instead: it undercounts
+                    # true hold time for a recovered position, but that's a
+                    # small, honest inaccuracy instead of a wrong one, and it
+                    # also means a fresh restart can't immediately start
+                    # churning positions it just recovered.
+                    'opened_at': datetime.now(),
                     'order_id': pos.ticket,
                     'confidence': cfg.ENSEMBLE_CONFIDENCE_THRESHOLD,
                 }

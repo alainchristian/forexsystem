@@ -39,18 +39,26 @@ class EnsembleStrategy:
         """
         # 1. LSTM Signal
         try:
-            lstm_pred = self.lstm.predict_next_price(recent_data)
-            pct_change = (lstm_pred - current_price) / current_price
-            
-            if lstm_pred > current_price:
+            # train_models.py trains this model on pct_change targets, not
+            # raw price, so one shared LSTM generalizes across symbols of
+            # very different price scales (EURUSD ~1.08 vs GBPJPY ~184).
+            # predict_next_price() therefore returns a predicted pct_change
+            # here, not an absolute price. Diffing it against current_price
+            # (as if it were a price) is what previously made every symbol
+            # saturate to SELL at strength=1.0 regardless of the actual
+            # prediction, since a ~0.001-scale value is negligible next to
+            # a ~1+-scale price.
+            lstm_pred_pct_change = self.lstm.predict_next_price(recent_data)
+
+            if lstm_pred_pct_change > 0:
                 lstm_signal = 1
-            elif lstm_pred < current_price:
+            elif lstm_pred_pct_change < 0:
                 lstm_signal = -1
             else:
                 lstm_signal = 0
-                
+
             # Cap strength at 1.0 based on a 0.5% move expectation
-            lstm_strength = min(abs(pct_change) / 0.005, 1.0)
+            lstm_strength = min(abs(lstm_pred_pct_change) / 0.005, 1.0)
         except Exception as e:
             logger.warning(f"LSTM prediction failed: {e}")
             lstm_signal = 0
@@ -81,11 +89,12 @@ class EnsembleStrategy:
             f"XGB: {xgb_dir} (conf={xgb_conf:.3f})  threshold={self.threshold:.2f}"
         )
 
-        # 4. Signal driven by XGBoost alone — LSTM is currently unreliable
-        #    (saturates to strength=1.0 in the same fixed direction across
-        #    every symbol due to a scaler mismatch, not a real per-symbol
-        #    signal). Fire when XGBoost picks a directional class above the
-        #    threshold.
+        # 4. Signal driven by XGBoost alone. LSTM's pct_change prediction is
+        #    now computed correctly (see the scaler-mismatch fix above) and
+        #    logged for visibility, but it still doesn't gate the trade -
+        #    incorporating it into the actual decision is a separate call
+        #    to make once its live signal quality has been validated.
+        #    Fire when XGBoost picks a directional class above the threshold.
         if xgb_signal == 0:
             logger.info("No signal: XGBoost returned FLAT")
             return 0, xgb_conf

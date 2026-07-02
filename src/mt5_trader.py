@@ -181,7 +181,13 @@ class MT5Trader:
 
         trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions)
         if not trade_check["valid"]:
-            if "max" in trade_check["reason"].lower() and self.open_positions:
+            # Ranked Replacement only makes sense for the global portfolio
+            # cap: it frees a slot by closing the globally lowest-confidence
+            # position, regardless of symbol. Per-symbol caps ("Max trades
+            # for X", "Max volume for X") aren't resolved by closing an
+            # unrelated symbol's position, so don't trigger it for those -
+            # a broader "max" substring match used to catch them too.
+            if trade_check["reason"] == "Global max open trades reached" and self.open_positions:
                 lowest_id = min(self.open_positions, key=lambda k: self.open_positions[k].get("confidence", 1.0))
                 lowest_pos = self.open_positions[lowest_id]
                 hold_minutes = (datetime.now() - lowest_pos["opened_at"]).total_seconds() / 60
