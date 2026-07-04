@@ -99,8 +99,9 @@ def test_xgboost_save_load(sample_data, tmp_path):
     
     save_path = str(tmp_path / "test_xgb")
     model.save(save_path)
-    
-    assert os.path.exists(f"{save_path}_xgboost.json")
+
+    # save()/load() treat save_path as a directory, not a filename prefix
+    assert os.path.exists(os.path.join(save_path, "xgboost_model.json"))
     
     new_model = XGBoostSignal()
     new_model.load(save_path)

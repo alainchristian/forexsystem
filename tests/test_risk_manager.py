@@ -33,30 +33,40 @@ def test_calculate_position_size_max_constraint():
     assert size == 25.0  # Capped at 5%
 
 def test_can_open_trade_circuit_breakers():
-    """Test daily loss and drawdown circuit breakers"""
+    """Test daily loss, drawdown, and global open-trades circuit breakers.
+
+    can_open_trade(symbol, volume, open_positions) takes open_positions as
+    a parameter rather than tracking it on the instance, and returns a
+    {'valid': bool, 'reason': str} dict rather than a bare bool.
+    """
     config = RiskConfig(
-        account_equity=10000.0, 
+        account_equity=10000.0,
         max_daily_loss_pct=0.05,
         max_drawdown_pct=0.15,
         max_open_trades=3
     )
     manager = RiskManager(config)
-    
-    assert manager.can_open_trade() is True
-    
+
+    assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is True
+
     # 1. Test Max Open Trades
-    manager.open_trades = [1, 2, 3]
-    assert manager.can_open_trade() is False
-    manager.open_trades = []
-    
+    open_positions = {
+        1: {'symbol': 'EURUSD', 'volume': 0.1},
+        2: {'symbol': 'GBPUSD', 'volume': 0.1},
+        3: {'symbol': 'USDJPY', 'volume': 0.1},
+    }
+    result = manager.can_open_trade('AUDUSD', 0.1, open_positions)
+    assert result['valid'] is False
+    assert 'Global max open trades' in result['reason']
+
     # 2. Test Daily Loss Breaker
     manager.update_daily_pnl(-600.0)  # -6% loss today
-    assert manager.can_open_trade() is False
-    
+    assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is False
+
     # Reset daily
     manager.reset_daily_stats()
-    assert manager.can_open_trade() is True
-    
+    assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is True
+
     # 3. Test Max Drawdown Breaker
     # Peak equity is 10000. We lose 1600. Equity = 8400.
     # Drawdown = (10000 - 8400) / 10000 = 16% > 15%
@@ -64,7 +74,7 @@ def test_can_open_trade_circuit_breakers():
     # Let's reset equity manually to simulate long-term DD without tripping daily limit
     manager.config.account_equity = 8400.0
     manager.daily_pnl = 0.0 # reset daily so it doesn't trip
-    assert manager.can_open_trade() is False
+    assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is False
 
 def test_validate_trade_setup():
     """Test Reward-to-Risk ratio validation"""

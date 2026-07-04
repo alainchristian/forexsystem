@@ -11,41 +11,38 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 from src.models.ensemble import EnsembleStrategy
 from src.backtester import Backtester
 
-def test_ensemble_alignment_and_confidence():
-    """Test that it only trades when signals align and confidence is high"""
+def test_ensemble_confidence_gate_and_lstm_is_advisory_only():
+    """Signal/confidence is driven entirely by XGBoost - LSTM's prediction is
+    logged for visibility (see test_lstm_signal_is_price_scale_independent)
+    but never gates or blocks the trade, even when it disagrees."""
     lstm_mock = MagicMock()
     xgb_mock = MagicMock()
-    
+
     strategy = EnsembleStrategy(lstm_mock, xgb_mock, threshold_confidence=0.65)
-    
-    # 1. Models Disagree
-    lstm_mock.predict_next_price.return_value = 1.01  # Long (+1%)
-    xgb_mock.predict_signal.return_value = np.array([-1]) # Short
-    xgb_mock.predict_proba.return_value = np.array([[0.8, 0.1, 0.1]]) # 80% confident short
-    
     recent_data = np.zeros((10, 5))
+
+    # 1. XGBoost FLAT -> no signal, regardless of LSTM
+    lstm_mock.predict_next_price.return_value = 0.01  # LSTM: strong BUY
+    xgb_mock.predict_signal.return_value = np.array([0])
+    xgb_mock.predict_proba.return_value = np.array([[0.1, 0.8, 0.1]])
     signal, conf = strategy.generate_signal(recent_data, current_price=1.0)
-    assert signal == 0 # Disagree = Flat
-    
-    # 2. Models Agree, Low Confidence
-    lstm_mock.predict_next_price.return_value = 1.001  # Very slight Long (+0.1%) -> strength = 0.1/0.5 = 0.2
-    xgb_mock.predict_signal.return_value = np.array([1]) # Long
-    xgb_mock.predict_proba.return_value = np.array([[0.1, 0.4, 0.5]]) # 50% confident long
-    
-    # Avg conf = (0.2 + 0.5) / 2 = 0.35 < 0.65
+    assert signal == 0
+    assert conf == pytest.approx(0.8)
+
+    # 2. XGBoost directional but below threshold -> blocked
+    xgb_mock.predict_signal.return_value = np.array([1])
+    xgb_mock.predict_proba.return_value = np.array([[0.1, 0.4, 0.5]])  # 50% long, < 0.65
     signal, conf = strategy.generate_signal(recent_data, current_price=1.0)
-    assert signal == 0 # Low confidence = Flat
-    assert conf == pytest.approx(0.35)
-    
-    # 3. Models Agree, High Confidence
-    lstm_mock.predict_next_price.return_value = 1.01  # Strong Long (+1%) -> strength = 1.0 (capped)
-    xgb_mock.predict_signal.return_value = np.array([1]) # Long
-    xgb_mock.predict_proba.return_value = np.array([[0.05, 0.05, 0.9]]) # 90% confident long
-    
-    # Avg conf = (1.0 + 0.9) / 2 = 0.95 >= 0.65
+    assert signal == 0
+    assert conf == pytest.approx(0.5)
+
+    # 3. XGBoost directional above threshold, LSTM disagrees -> still fires
+    lstm_mock.predict_next_price.return_value = -0.01  # LSTM: strong SELL (disagrees)
+    xgb_mock.predict_signal.return_value = np.array([1])  # XGB: BUY
+    xgb_mock.predict_proba.return_value = np.array([[0.05, 0.05, 0.9]])  # 90% confident long
     signal, conf = strategy.generate_signal(recent_data, current_price=1.0)
-    assert signal == 1 # Agree + High Conf = Long!
-    assert conf == 0.95
+    assert signal == 1
+    assert conf == pytest.approx(0.9)
 
 def test_lstm_signal_is_price_scale_independent(caplog):
     """Regression test for the pct_change/price scaler mismatch.

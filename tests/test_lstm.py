@@ -70,9 +70,10 @@ def test_lstm_save_load(sample_data, tmp_path):
     
     save_path = str(tmp_path / "test_model")
     predictor.save(save_path)
-    
-    assert os.path.exists(f"{save_path}_model.keras")
-    assert os.path.exists(f"{save_path}_scaler.pkl")
+
+    # save()/load() treat save_path as a directory, not a filename prefix
+    assert os.path.exists(os.path.join(save_path, "lstm_model.keras"))
+    assert os.path.exists(os.path.join(save_path, "lstm_scaler.pkl"))
     
     # Load into new instance
     new_predictor = LSTMPredictor(lookback=10)
