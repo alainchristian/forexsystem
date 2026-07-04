@@ -11,7 +11,7 @@ from config.config import (
 @dataclass
 class RiskConfig:
     account_equity: float
-    risk_per_trade: float = 0.01  # 1% per trade (10 symbols × 1% = 10% max exposure)
+    risk_per_trade: float = 0.01  # 1% per trade (capped at max_open_trades x 1% = 10% max exposure)
     max_daily_loss_pct: float = 0.05  # -5% daily stop
     max_drawdown_pct: float = 0.15  # -15% drawdown stop
     max_open_trades: int = 10

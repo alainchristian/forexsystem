@@ -40,6 +40,20 @@ SYMBOLS = {
     "EURGBP": "EURGBP=X",
     "EURJPY": "EURJPY=X",
     "GBPJPY": "GBPJPY=X",
+    "AUDCAD": "AUDCAD=X",
+    "AUDNZD": "AUDNZD=X",
+    "AUDCHF": "AUDCHF=X",
+    "CADCHF": "CADCHF=X",
+    "EURCAD": "EURCAD=X",
+    "EURCHF": "EURCHF=X",
+    "EURNZD": "EURNZD=X",
+    "GBPCAD": "GBPCAD=X",
+    "GBPCHF": "GBPCHF=X",
+    "CADJPY": "CADJPY=X",
+    "CHFJPY": "CHFJPY=X",
+    "NZDJPY": "NZDJPY=X",
+    "NZDCAD": "NZDCAD=X",
+    "NZDCHF": "NZDCHF=X",
 }
 
 UPSERT_SQL = """
@@ -153,6 +167,32 @@ def fetch_yfinance(symbol: str, ticker: str, days: int = 730):
     return out
 
 
+def ensure_table(conn, symbol: str):
+    """Create the per-symbol OHLCV table if it doesn't exist yet (mirrors
+    ForexDataPipeline.create_tables()'s schema in src/data_ingestion.py)."""
+    table = symbol.lower()
+    cur = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS ohlcv_{table} (
+            id BIGSERIAL PRIMARY KEY,
+            symbol VARCHAR(10) NOT NULL,
+            timeframe INT NOT NULL,
+            timestamp TIMESTAMP NOT NULL,
+            open DOUBLE PRECISION NOT NULL,
+            high DOUBLE PRECISION NOT NULL,
+            low DOUBLE PRECISION NOT NULL,
+            close DOUBLE PRECISION NOT NULL,
+            volume BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timeframe, timestamp)
+        );
+        CREATE INDEX IF NOT EXISTS idx_{table}_ts ON ohlcv_{table}(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_{table}_tf ON ohlcv_{table}(timeframe, timestamp DESC);
+    """)
+    conn.commit()
+    cur.close()
+
+
 def store(conn, symbol: str, data: dict):
     """Write {timeframe: DataFrame} into PostgreSQL."""
     table = symbol.lower()
@@ -173,7 +213,9 @@ def store(conn, symbol: str, data: dict):
     return total
 
 
-def main():
+def main(symbols: list = None):
+    """symbols: optional list to backfill just a subset (e.g. newly-added
+    pairs) instead of the full SYMBOLS map. Run: python scripts/bootstrap_data.py [SYMBOL ...]"""
     logger.info("Connecting to PostgreSQL...")
     conn = psycopg2.connect(**DB)
 
@@ -185,9 +227,12 @@ def main():
         yf_available = False
         logger.warning("yfinance not installed. Run: pip install yfinance")
 
+    targets = {s: SYMBOLS[s] for s in symbols} if symbols else SYMBOLS
+
     total_rows = 0
-    for symbol, yf_ticker in SYMBOLS.items():
+    for symbol, yf_ticker in targets.items():
         logger.info("=== %s ===", symbol)
+        ensure_table(conn, symbol)
 
         # Try MT5 first (skip if MT5 IPC is unavailable to avoid 60s timeout per symbol)
         data = None  # set to fetch_mt5(symbol) to re-enable MT5
@@ -211,4 +256,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:] or None)

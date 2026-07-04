@@ -137,6 +137,115 @@ SYMBOLS = {
         'min_lot': 0.01,
         'max_lot': 100.0
     },
+    # --- Non-USD crosses (round 1): commodity currencies ---
+    # No USD/EUR/GBP/JPY exposure, added so the model has instruments to
+    # express a view that isn't mechanically tied to USD direction. Note:
+    # 3 of these 4 share AUD, so they're not independent of each other -
+    # see the "round 2" crosses below, added specifically to avoid piling
+    # further onto USD or AUD.
+    'AUDCAD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0006,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'AUDNZD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0007,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'AUDCHF': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0006,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'CADCHF': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0006,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    # --- Non-USD crosses (round 2): fill in EUR/GBP/JPY/CAD/CHF/NZD ---
+    # None of these touch USD or AUD, the two currencies already most
+    # represented above. Brings currency exposure across all 24 symbols to
+    # USD=7, CAD=7, CHF=7, EUR=6, NZD=6, JPY=6, GBP=5, AUD=4 - flatter than
+    # the 7-vs-2 (USD-vs-NZD) split before this round.
+    'EURCAD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0005,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'EURCHF': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0004,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'EURNZD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0008,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'GBPCAD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0008,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'GBPCHF': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0007,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'CADJPY': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.01,
+        'max_spread': 0.06,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'CHFJPY': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.01,
+        'max_spread': 0.08,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'NZDJPY': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.01,
+        'max_spread': 0.08,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'NZDCAD': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0009,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
+    'NZDCHF': {
+        'timeframes': [240, 1440],
+        'pip_value': 0.0001,
+        'max_spread': 0.0008,
+        'min_lot': 0.01,
+        'max_lot': 100.0
+    },
 }
 
 ACTIVE_SYMBOLS = list(SYMBOLS.keys())
