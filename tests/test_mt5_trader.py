@@ -86,9 +86,10 @@ def test_submit_order_success(mock_mt5, mock_dependencies):
 
 @patch('src.mt5_trader.mt5')
 def test_submit_order_blocked_by_risk(mock_mt5, mock_dependencies):
-    """Test that Risk Manager can block trades before sending to MT5"""
+    """Circuit-breaker blocks (daily loss / drawdown) are rare and important
+    enough to still alert on Telegram immediately."""
     risk_mgr, telegram = mock_dependencies
-    risk_mgr.can_open_trade.return_value = {'valid': False, 'reason': 'Risk limits exceeded'}
+    risk_mgr.can_open_trade.return_value = {'valid': False, 'reason': 'Daily loss limit reached'}
 
     mock_mt5.initialize.return_value = True
     mock_mt5.account_info.return_value = MagicMock(balance=10000.0, currency="USD")
@@ -103,7 +104,29 @@ def test_submit_order_blocked_by_risk(mock_mt5, mock_dependencies):
 
         assert order_id is None
         mock_mt5.order_send.assert_not_called()  # It never hit the API
-        telegram.send_alert.assert_called_once_with("⛔ Trade blocked: Risk limits exceeded")
+        telegram.send_alert.assert_called_once_with("⛔ Trade blocked: Daily loss limit reached")
+
+
+@patch('src.mt5_trader.mt5')
+def test_submit_order_blocked_by_per_symbol_cap_does_not_alert(mock_mt5, mock_dependencies):
+    """Per-symbol/volume caps are routine and fire repeatedly whenever a
+    symbol that already has a position keeps generating signals - these
+    must not spam a Telegram alert on every occurrence (they still log)."""
+    risk_mgr, telegram = mock_dependencies
+    risk_mgr.can_open_trade.return_value = {'valid': False, 'reason': 'Max trades for USDJPY (1) reached'}
+
+    mock_mt5.initialize.return_value = True
+    mock_mt5.account_info.return_value = MagicMock(balance=10000.0, currency="USD")
+
+    with patch('src.mt5_trader.MT5_AVAILABLE', True):
+        trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+        trader.initialize()
+
+        order_id = asyncio.run(trader.submit_order("USDJPY", 1, 1.0, 1.1, 1.0, 1.2))
+
+        assert order_id is None
+        mock_mt5.order_send.assert_not_called()
+        telegram.send_alert.assert_not_called()
 
 
 # ----------------------------------------------------------------------------

@@ -222,7 +222,14 @@ class MT5Trader:
                     return None
             else:
                 self.logger.warning(f"Trade blocked: {trade_check['reason']}")
-                await self.telegram.send_alert(f"⛔ Trade blocked: {trade_check['reason']}")
+                # Per-symbol/volume caps are routine and fire repeatedly
+                # whenever a symbol that already has a position keeps
+                # generating signals - alerting on every occurrence just
+                # spams Telegram with no new information each time. The
+                # account-wide circuit breakers are rare and important
+                # enough to still page immediately.
+                if trade_check["reason"] in ("Daily loss limit reached", "Max drawdown reached"):
+                    await self.telegram.send_alert(f"⛔ Trade blocked: {trade_check['reason']}")
                 return None
 
         validation = self.risk_mgr.validate_trade_setup(entry_price, stop_loss, take_profit)
