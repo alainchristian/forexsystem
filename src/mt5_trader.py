@@ -144,12 +144,17 @@ class MT5Trader:
         except Exception:
             return {}
 
-    def _bridge_positions(self) -> list:
+    def _bridge_positions(self) -> Optional[list]:
+        """Returns None (not []) if positions.json couldn't be read/parsed,
+        so callers can tell a genuine "zero open positions" apart from a
+        failed read - conflating the two made every real open position
+        look closed on any transient file read hiccup."""
         try:
             data = json.loads((BRIDGE_DIR / "positions.json").read_text(encoding="utf-8"))
             return [_Position(p) for p in data]
-        except Exception:
-            return []
+        except Exception as e:
+            self.logger.warning(f"Could not read bridge positions.json: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Order submission
@@ -539,13 +544,25 @@ class MT5Trader:
             self.logger.warning(f"SL modify failed #{order_id}: {res.comment if res else 'no result'}")
             return False
 
-    def get_open_positions(self) -> list:
+    def get_open_positions(self) -> Optional[list]:
+        """Live open positions from MT5. Returns None (not []) if the query
+        itself failed, so callers can tell "confirmed zero positions" apart
+        from "couldn't reach MT5 this cycle". mt5.positions_get() returns
+        None on error and an empty tuple when genuinely empty - collapsing
+        both into [] previously made every currently-open position look
+        closed on any transient MT5 hiccup, since _sync_closed_positions()
+        compares tracked tickets against this list and treats anything
+        missing as closed via SL/TP.
+        """
         if not self.mt5_initialized:
-            return []
+            return None
         if self._bridge_mode:
             return self._bridge_positions()
         positions = mt5.positions_get()
-        return list(positions) if positions else []
+        if positions is None:
+            self.logger.warning(f"positions_get() failed: {mt5.last_error()}")
+            return None
+        return list(positions)
 
     def _get_live_profit(self, ticket: int) -> Optional[float]:
         """Look up a position's current floating profit/loss from MT5."""

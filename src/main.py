@@ -149,7 +149,17 @@ class TradingSystem:
         """Remove positions from open_positions that MT5 has already closed (SL/TP hit)."""
         if not self.trader.mt5_initialized:
             return
-        live_tickets = {p.ticket for p in (self.trader.get_open_positions() or [])}
+        live_positions = self.trader.get_open_positions()
+        if live_positions is None:
+            # Query failed - do NOT treat every tracked position as closed
+            # just because we couldn't confirm what's actually open this
+            # cycle. get_open_positions() used to collapse "query failed"
+            # and "genuinely zero positions" into the same [], which made
+            # a single transient MT5 hiccup look like every open position
+            # had hit its SL/TP simultaneously.
+            logger.warning("Could not fetch live positions from MT5 this cycle - skipping sync")
+            return
+        live_tickets = {p.ticket for p in live_positions}
         stale = [tid for tid in list(self.trader.open_positions) if tid not in live_tickets]
         for tid in stale:
             pos = self.trader.open_positions.pop(tid)
@@ -185,6 +195,9 @@ class TradingSystem:
     async def _reconcile_positions(self):
         """On startup, rebuild open_positions from whatever MT5 has open."""
         mt5_positions = self.trader.get_open_positions()
+        if mt5_positions is None:
+            logger.error("Could not fetch positions from MT5 at startup - open_positions will start empty")
+            return
         recovered = 0
         for pos in mt5_positions:
             if pos.magic == 123456 and pos.ticket not in self.trader.open_positions:
