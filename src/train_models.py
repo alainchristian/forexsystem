@@ -33,23 +33,62 @@ def get_historical_df(pipeline: ForexDataPipeline, symbol: str, timeframe: int) 
         raise RuntimeError(f"No historical data found for {symbol} {timeframe}m")
     return df
 
-def train_lstm(lstm: LSTMPredictor, df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
-    """Prepare data and train the LSTM model."""
-    (X_train, y_train), (X_test, y_test) = lstm.prepare_data(df, features_df, test_size=0.2)
+def train_lstm(lstm: LSTMPredictor, per_symbol_dfs: list, per_symbol_features: list) -> dict:
+    """Prepare data per-symbol, then combine, so no lookback window or
+    train/test split ever crosses a symbol boundary.
+
+    prepare_data() windows features[i-lookback:i] to predict row i. Calling
+    it once on all symbols concatenated end-to-end let windows near each
+    of the ~23 symbol boundaries splice together candles from two
+    different currency pairs, and the trailing 20% test split held out
+    whichever symbols happened to land last in the concatenation instead
+    of a representative slice of every symbol.
+    """
+    X_train_parts, y_train_parts, X_test_parts, y_test_parts = [], [], [], []
+    for df, features_df in zip(per_symbol_dfs, per_symbol_features):
+        (X_tr, y_tr), (X_te, y_te) = lstm.prepare_data(df, features_df, test_size=0.2)
+        X_train_parts.append(X_tr)
+        y_train_parts.append(y_tr)
+        X_test_parts.append(X_te)
+        y_test_parts.append(y_te)
+
+    X_train = np.concatenate(X_train_parts)
+    y_train = np.concatenate(y_train_parts)
+    X_test = np.concatenate(X_test_parts)
+    y_test = np.concatenate(y_test_parts)
+
+    # Shuffle the combined training set once (X/y paired) before handing it
+    # to Keras. model.fit()'s internal validation_split takes the last 10%
+    # of whatever order the array is already in, before any shuffling - left
+    # unshuffled, that slice would still be biased toward whichever symbols
+    # happen to land last in this concatenation, the same root issue as the
+    # windowing/labeling bug, just one level deeper (affects early-stopping
+    # decisions during training, not the final held-out test metrics above).
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(len(X_train))
+    X_train, y_train = X_train[perm], y_train[perm]
+
     logger.info(f"LSTM training shapes - X: {X_train.shape}, y: {y_train.shape}")
     lstm.train(X_train, y_train, epochs=30, batch_size=32)
     loss, mae = lstm.model.evaluate(X_test, y_test, verbose=0)
     logger.info(f"LSTM validation - loss: {loss:.6f}, mae: {mae:.6f}")
     return {"val_loss": float(loss), "val_mae": float(mae)}
 
-def train_xgboost(xgb: XGBoostSignal, df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
-    """Generate labels and train the XGBoost classifier.
+def train_xgboost(xgb: XGBoostSignal, per_symbol_dfs: list, per_symbol_features: list) -> dict:
+    """Generate labels per-symbol, then combine, and train the classifier.
+
+    prepare_labels() looks `lookahead` bars into the future (close[i+lookahead])
+    to label row i - calling it on the symbol-concatenated dataframe let that
+    lookahead read into the next symbol's prices near each boundary.
 
     threshold_pct=0.002 (0.2%) labels more bars as directional vs the old 0.5%,
     fixing the class imbalance that caused XGBoost to always predict FLAT.
     """
-    labels = xgb.prepare_labels(df, lookahead=5, threshold_pct=0.002)
+    label_parts = [xgb.prepare_labels(df, lookahead=5, threshold_pct=0.002) for df in per_symbol_dfs]
+    labels = np.concatenate(label_parts)
+    features_df = pd.concat(per_symbol_features, ignore_index=True)
     X = features_df.values
+
     logger.info(f"XGBoost training - {X.shape[0]} samples, {X.shape[1]} features")
     counts = {-1: (labels == -1).sum(), 0: (labels == 0).sum(), 1: (labels == 1).sum()}
     logger.info(f"Label distribution - SELL: {counts[-1]}, FLAT: {counts[0]}, BUY: {counts[1]}")
@@ -136,24 +175,23 @@ def main():
         pipeline.close()
         return
 
-    combined_df_pct = pd.concat(all_dfs, ignore_index=True)
-    combined_df_orig = pd.concat([df for df, _ in all_features], ignore_index=True)
-    combined_features = pd.concat([feat for _, feat in all_features], ignore_index=True)
-    logger.info(
-        f"Combined dataset: {len(combined_df_pct)} rows across {len(all_dfs)} symbols"
-    )
+    total_rows = sum(len(df) for df in all_dfs)
+    logger.info(f"Combined dataset: {total_rows} rows across {len(all_dfs)} symbols")
 
     # -------------------------------------------------------------------------
-    # Train models on the combined dataset
+    # Train models — windowed/labeled per-symbol inside train_lstm/train_xgboost,
+    # only combined afterward, so no lookback window or lookahead label ever
+    # crosses a symbol boundary.
     # -------------------------------------------------------------------------
     lstm = LSTMPredictor(lookback=60)
     xgb_model = XGBoostSignal()
+    per_symbol_features = [feat for _, feat in all_features]
 
-    logger.info("Training LSTM on combined dataset (pct_change close)...")
-    lstm_metrics = train_lstm(lstm, combined_df_pct, combined_features)
+    logger.info("Training LSTM (pct_change close)...")
+    lstm_metrics = train_lstm(lstm, all_dfs, per_symbol_features)
 
-    logger.info("Training XGBoost on combined dataset (original close for labels)...")
-    xgb_metrics = train_xgboost(xgb_model, combined_df_orig, combined_features)
+    logger.info("Training XGBoost (original close for labels)...")
+    xgb_metrics = train_xgboost(xgb_model, [df for df, _ in all_features], per_symbol_features)
 
     # -------------------------------------------------------------------------
     # Save into a new timestamped version, then promote it to the fixed
@@ -168,7 +206,7 @@ def main():
     metadata = {
         "trained_at": datetime.now().isoformat(),
         "symbols": trained_symbols,
-        "rows": len(combined_df_pct),
+        "rows": total_rows,
         "lstm": lstm_metrics,
         "xgboost": xgb_metrics,
         "git_commit": _git_commit(),

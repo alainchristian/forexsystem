@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 import psycopg2
 from psycopg2.extras import execute_batch
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 import redis
 import logging
 import time
@@ -78,6 +80,7 @@ class ForexDataPipeline:
         self.mt5_config = mt5_config
         
         self.db_conn = None
+        self.db_engine = None  # SQLAlchemy engine, used only for pd.read_sql_query
         self.redis_conn = None
         self.mt5_initialized = False
         
@@ -97,6 +100,15 @@ class ForexDataPipeline:
                 password=self.db_config['password'],
                 host=self.db_config['host'],
                 port=self.db_config['port']
+            )
+            # Separate SQLAlchemy engine for pd.read_sql_query() - pandas
+            # only officially supports SQLAlchemy connectables there, and
+            # warns (harmlessly, but noisily) when given a raw DBAPI2
+            # connection like the psycopg2 one above. Cursor-based writes
+            # (execute_batch, CREATE TABLE, etc.) keep using self.db_conn.
+            self.db_engine = create_engine(
+                f"postgresql+psycopg2://{self.db_config['user']}:{self.db_config['password']}"
+                f"@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
             )
             logger.info(f"PostgreSQL connected: {self.db_config['host']}")
         except psycopg2.Error as e:
@@ -366,15 +378,15 @@ class ForexDataPipeline:
             query += f" LIMIT {limit}"
         
         try:
-            df = pd.read_sql_query(query, self.db_conn)
+            df = pd.read_sql_query(query, self.db_engine)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             logger.debug(f"Retrieved {len(df)} records: {symbol} {timeframe}m")
             return df
         
-        except psycopg2.Error as e:
+        except (psycopg2.Error, SQLAlchemyError) as e:
             logger.error(f"Query error: {e}")
             return None
-    
+
     def cache_latest_price(self, symbol: str, timeframe: int, price: float, ttl: int = None):
         """Cache latest market price in Redis"""
         ttl = ttl or DATA_CONFIG['cache_ttl']
@@ -417,6 +429,9 @@ class ForexDataPipeline:
         if self.db_conn:
             self.db_conn.close()
             logger.info("PostgreSQL connection closed")
+
+        if self.db_engine:
+            self.db_engine.dispose()
         
         if self.mt5_initialized and MT5_AVAILABLE:
             mt5.shutdown()

@@ -83,7 +83,10 @@ class XGBoostSignal:
         self.feature_names = feature_names if feature_names is not None else [f"feature_{i}" for i in range(X.shape[1])]
         y_xgb = self._map_labels_to_xgb(y)
         
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=False)
+        # shuffle=True so folds mix rows from every symbol in the combined
+        # multi-symbol training set instead of splitting along whatever
+        # order symbols happened to be concatenated in.
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         
         cv_accuracies = []
         cv_precisions = []
