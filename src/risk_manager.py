@@ -5,8 +5,9 @@ from typing import List, Dict, Optional
 
 from config.config import (
     SYMBOLS, MIN_REPLACEMENT_HOLD_MINUTES, MIN_REPLACEMENT_CONFIDENCE_GAP,
-    MIN_REPLACEMENT_PROFIT,
+    MIN_REPLACEMENT_PROFIT, RISK_KELLY_MULTIPLIER_MIN, RISK_KELLY_MULTIPLIER_MAX,
 )
+from src.execution_logic import calculate_kelly_fraction
 
 @dataclass
 class RiskConfig:
@@ -69,10 +70,10 @@ class RiskManager:
                 avg_loss = abs(np.mean([t['pnl'] for t in historical_trades if t['pnl'] < 0]))
                 
                 if avg_loss > 0:
-                    # Kelly: f* = (w*b - q) / b, where b is avg_win / avg_loss and q is (1-w)
-                    b = avg_win / avg_loss
-                    kelly_frac = (win_rate * b - (1 - win_rate)) / b
-                    kelly_frac = max(0.5, min(1.5, kelly_frac))  # Conservative: 0.5–1.5x Kelly
+                    kelly_frac = calculate_kelly_fraction(
+                        win_rate, avg_win, avg_loss,
+                        min_frac=RISK_KELLY_MULTIPLIER_MIN, max_frac=RISK_KELLY_MULTIPLIER_MAX,
+                    )
                     position_size *= kelly_frac
         
         # Constraint: never risk more than 5% per trade absolute

@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 import subprocess
 import numpy as np
 from datetime import datetime
@@ -134,6 +135,14 @@ def main():
     # anything, in case this models/ directory predates versioning.
     model_versioning.bootstrap_baseline(models_dir)
 
+    # Created up front (not after training) so each symbol's feature scaler
+    # can be saved into it during the loop below, right alongside the data
+    # it was fit on — model_versioning.promote() later copies this whole
+    # version's scalers/ subdir into the live models/scalers/ path.
+    version_dir = model_versioning.new_version_dir(models_dir)
+    scalers_dir = version_dir / "scalers"
+    scalers_dir.mkdir(parents=True, exist_ok=True)
+
     # -------------------------------------------------------------------------
     # Collect all symbols' data into one combined dataset before training.
     # Previously the loop trained symbol-by-symbol and each iteration overwrote
@@ -161,6 +170,12 @@ def main():
               .normalize()
         features = engine.get_features(normalized=True)
 
+        # Persist this symbol's fitted scaler so main.py can transform live
+        # features against these exact training-time statistics at inference
+        # time, instead of fitting a fresh scaler on a handful of live bars
+        # every cycle (the live train/serve skew this fixes).
+        engine.save_scaler(str(scalers_dir / f"{symbol}.pkl"))
+
         # Store original prices for XGBoost label generation, then normalise
         # close to pct_change so LSTM trains on a scale-free target across all
         # symbols (avoids scaler_y mismatch between e.g. EURUSD ~1.08 and GBPJPY ~184).
@@ -172,6 +187,7 @@ def main():
 
     if not all_dfs:
         logger.error("No data collected — aborting training.")
+        shutil.rmtree(version_dir, ignore_errors=True)
         pipeline.close()
         return
 
@@ -194,12 +210,12 @@ def main():
     xgb_metrics = train_xgboost(xgb_model, [df for df, _ in all_features], per_symbol_features)
 
     # -------------------------------------------------------------------------
-    # Save into a new timestamped version, then promote it to the fixed
-    # models/ path main.py loads from. Keeping every version (pruned to the
-    # most recent 8) means a bad training run can be rolled back instead of
+    # Save LSTM/XGB into the version dir created earlier (which already holds
+    # this run's per-symbol scalers/), then promote it to the fixed models/
+    # path main.py loads from. Keeping every version (pruned to the most
+    # recent 8) means a bad training run can be rolled back instead of
     # silently overwriting the model that was working.
     # -------------------------------------------------------------------------
-    version_dir = model_versioning.new_version_dir(models_dir)
     lstm.save(str(version_dir))
     xgb_model.save(str(version_dir))
 

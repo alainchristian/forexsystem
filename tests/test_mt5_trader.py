@@ -489,3 +489,158 @@ def test_reconcile_pending_pnl_alerts_loudly_on_repeated_failure(mock_dependenci
     assert telegram.send_alert.call_count == 2
     for call in telegram.send_alert.call_args_list:
         assert "UNCONFIRMED" in call.args[0]
+
+
+# ----------------------------------------------------------------------------
+# Bridge-mode close_position / modify_position_sl — result verification
+#
+# Previously both blindly slept 6s and reported success regardless of what
+# the SignalBridge EA actually did. These tests mock _bridge_wait_result
+# directly (its own polling behaviour is exercised elsewhere/implicitly via
+# submit_order's bridge tests) so they can assert the OK / error-status /
+# timeout branches without real filesystem wait timing.
+# ----------------------------------------------------------------------------
+
+def _bridge_trader_with_position(mock_dependencies, order_id=321):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = True
+    trader.open_positions[order_id] = {
+        "symbol": "EURUSD", "direction": 1, "volume": 0.1,
+        "entry": 1.10, "sl": 1.09, "tp": 1.12,
+        "opened_at": datetime.now(), "order_id": order_id, "confidence": 0.6,
+    }
+    return trader
+
+
+def test_close_position_bridge_success(mock_dependencies):
+    trader = _bridge_trader_with_position(mock_dependencies)
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value={"id": "x", "status": "OK"})
+
+    ok = asyncio.run(trader.close_position(321, reason="Manual"))
+
+    assert ok is True
+    assert 321 not in trader.open_positions
+    assert trader.trade_log[-1]["order_id"] == 321
+    trader.telegram.send_alert.assert_called_once()
+    assert "closed" in trader.telegram.send_alert.call_args[0][0].lower()
+
+
+def test_close_position_bridge_error_status_does_not_mutate_state(mock_dependencies):
+    trader = _bridge_trader_with_position(mock_dependencies)
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value={"id": "x", "status": "ERROR", "error": "no ticket"})
+
+    ok = asyncio.run(trader.close_position(321, reason="Manual"))
+
+    assert ok is False
+    assert 321 in trader.open_positions  # untouched
+    assert trader.trade_log == []
+    trader.telegram.send_alert.assert_called_once()
+    assert "no ticket" in trader.telegram.send_alert.call_args[0][0]
+
+
+def test_close_position_bridge_timeout_does_not_mutate_state(mock_dependencies):
+    trader = _bridge_trader_with_position(mock_dependencies)
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value=None)  # timed out
+
+    ok = asyncio.run(trader.close_position(321, reason="Manual"))
+
+    assert ok is False
+    assert 321 in trader.open_positions
+    assert trader.trade_log == []
+    trader.telegram.send_alert.assert_called_once()
+    assert "timeout" in trader.telegram.send_alert.call_args[0][0].lower()
+
+
+def test_modify_position_sl_bridge_success(mock_dependencies):
+    trader = _bridge_trader_with_position(mock_dependencies)
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value={"id": "x", "status": "OK"})
+
+    ok = asyncio.run(trader.modify_position_sl(321, 1.095))
+
+    assert ok is True
+    assert trader.open_positions[321]["sl"] == 1.095
+
+
+def test_modify_position_sl_bridge_failure_does_not_mutate_sl(mock_dependencies):
+    trader = _bridge_trader_with_position(mock_dependencies)
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value=None)  # timed out
+
+    ok = asyncio.run(trader.modify_position_sl(321, 1.095))
+
+    assert ok is False
+    assert trader.open_positions[321]["sl"] == 1.09  # original value, untouched
+    trader.telegram.send_alert.assert_called_once()
+
+
+# ----------------------------------------------------------------------------
+# Bridge-mode spread check in submit_order — default-off flag
+#
+# The real fix (the EA reporting live spread) requires updating
+# SignalBridge.mq5 on the VPS, which is outside this repo. These tests only
+# cover the Python-side consuming/rejecting logic, gated behind
+# BRIDGE_SPREAD_CHECK_ENABLED so it can't reject every bridge-mode trade the
+# moment this code deploys (the EA doesn't write spread data yet).
+# ----------------------------------------------------------------------------
+
+def _bridge_trader_for_submit(mock_dependencies):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = True
+    trader._bridge_account = MagicMock(return_value={"free_margin": 5000.0})
+    trader._bridge_write = MagicMock()
+    trader._bridge_wait_result = AsyncMock(return_value={"id": "x", "status": "OK", "ticket": 999})
+    return trader
+
+
+def _submit(trader):
+    return asyncio.run(trader.submit_order(
+        symbol="EURUSD", direction=1, volume=0.1,
+        entry_price=1.10, stop_loss=1.09, take_profit=1.12,
+    ))
+
+
+def test_submit_order_bridge_spread_check_disabled_by_default(mock_dependencies):
+    trader = _bridge_trader_for_submit(mock_dependencies)
+    trader._bridge_tick = MagicMock(side_effect=AssertionError("must not be consulted when disabled"))
+
+    order_id = _submit(trader)
+
+    assert order_id == 999
+
+
+def test_submit_order_bridge_rejects_when_enabled_and_spread_data_missing(mock_dependencies):
+    trader = _bridge_trader_for_submit(mock_dependencies)
+    trader._bridge_tick = MagicMock(return_value=None)
+
+    with patch('src.mt5_trader.BRIDGE_SPREAD_CHECK_ENABLED', True):
+        order_id = _submit(trader)
+
+    assert order_id is None
+
+
+def test_submit_order_bridge_rejects_when_spread_too_wide(mock_dependencies):
+    trader = _bridge_trader_for_submit(mock_dependencies)
+    trader._bridge_tick = MagicMock(return_value={"spread": 0.01})  # EURUSD max_spread is 0.0003
+
+    with patch('src.mt5_trader.BRIDGE_SPREAD_CHECK_ENABLED', True):
+        order_id = _submit(trader)
+
+    assert order_id is None
+
+
+def test_submit_order_bridge_allows_when_spread_ok(mock_dependencies):
+    trader = _bridge_trader_for_submit(mock_dependencies)
+    trader._bridge_tick = MagicMock(return_value={"spread": 0.0001})
+
+    with patch('src.mt5_trader.BRIDGE_SPREAD_CHECK_ENABLED', True):
+        order_id = _submit(trader)
+
+    assert order_id == 999

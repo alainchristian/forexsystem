@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -28,6 +29,7 @@ from src import db
 from src.models.lstm_predictor import LSTMPredictor
 from src.models.xgboost_classifier import XGBoostSignal
 from src.models.ensemble import EnsembleStrategy
+from src.features import load_scaler
 
 logging.config.dictConfig(cfg.LOGGING)
 logger = logging.getLogger('Main')
@@ -81,6 +83,30 @@ class TradingSystem:
             self.lstm, self.xgb,
             threshold_confidence=cfg.ENSEMBLE_CONFIDENCE_THRESHOLD
         )
+
+        # Per-symbol feature scalers persisted by train_models.py. Loaded once
+        # here (not re-read from disk every cycle) so process_symbol() can
+        # transform live features against training-time statistics instead of
+        # fitting a fresh scaler on a handful of live bars each cycle — that
+        # mismatch was a live train/serve skew affecting every prediction.
+        self.feature_scalers: Dict[str, StandardScaler] = {}
+        missing_scalers = []
+        for symbol in cfg.ACTIVE_SYMBOLS:
+            scaler_path = cfg.FEATURE_SCALER_DIR / f"{symbol}.pkl"
+            if scaler_path.exists():
+                self.feature_scalers[symbol] = load_scaler(str(scaler_path))
+            else:
+                missing_scalers.append(symbol)
+        if missing_scalers:
+            logger.critical(
+                f"No persisted feature scaler for: {missing_scalers} — "
+                f"these symbols will not trade until train_models.py is run."
+            )
+        if not self.feature_scalers:
+            logger.critical(
+                "Zero feature scalers loaded — run train_models.py before starting main.py"
+            )
+            sys.exit(1)
 
         # In-memory price cache used as Redis fallback for trailing stops
         self._price_cache: Dict[str, float] = {}
@@ -368,6 +394,13 @@ class TradingSystem:
             logger.error(f"Unknown symbol rejected: {symbol}")
             return
 
+        # Refuse to trade a symbol with no persisted feature scaler rather than
+        # silently falling back to fitting one on live data — that fallback is
+        # exactly the train/serve skew bug this gate exists to prevent.
+        if symbol not in self.feature_scalers:
+            logger.error(f"{symbol}: no persisted feature scaler — refusing to trade until retrained")
+            return
+
         try:
             df = await asyncio.to_thread(self._fetch_ohlcv, symbol)
             if df is None or len(df) < 150:
@@ -392,8 +425,9 @@ class TradingSystem:
             fe = FeatureEngine(df)
             fe.add_technical_indicators() \
               .add_price_action_features() \
-              .add_market_microstructure() \
-              .normalize()
+              .add_market_microstructure()
+            fe.scaler = self.feature_scalers[symbol]
+            fe.normalize(fit=False)
 
             recent_data = fe.features_normalized.iloc[-60:].values
             current_price = df['close'].iloc[-1]
@@ -519,7 +553,9 @@ class TradingSystem:
 
             initial_risk = abs(pos['entry'] - pos['sl']) * pos['volume']
             if profit > 2 * initial_risk:
-                new_sl = pos['entry'] + (0.005 if pos['direction'] > 0 else -0.005)
+                pip_value = cfg.SYMBOLS[symbol]['pip_value']
+                lock_offset = cfg.TRAILING_STOP_LOCK_PIPS * pip_value
+                new_sl = pos['entry'] + (lock_offset if pos['direction'] > 0 else -lock_offset)
                 current_sl = pos['sl']
                 # Only move SL in the profitable direction, never backwards
                 sl_improved = (
@@ -527,7 +563,7 @@ class TradingSystem:
                     (pos['direction'] < 0 and new_sl < current_sl)
                 )
                 if sl_improved:
-                    if self.trader.modify_position_sl(order_id, new_sl):
+                    if await self.trader.modify_position_sl(order_id, new_sl):
                         logger.info(
                             f"Trailing SL #{order_id} {symbol}: {current_sl:.5f} → {new_sl:.5f}"
                         )

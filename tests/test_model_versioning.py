@@ -138,6 +138,35 @@ def test_prune_keeps_most_recent_and_active(tmp_path):
     assert (tmp_path / "versions" / "v1").exists()
 
 
+def test_promote_copies_scalers_and_removes_stale_ones(tmp_path):
+    """A model rollback/promote must never leave a live scaler behind for a
+    symbol that isn't part of the version being promoted - that would
+    silently reintroduce train/serve skew for that symbol."""
+    v1_dir = tmp_path / "versions" / "v1"
+    _write_artifacts(v1_dir, content="one")
+    (v1_dir / "scalers").mkdir(parents=True)
+    (v1_dir / "scalers" / "EURUSD.pkl").write_text("eurusd-v1")
+    (v1_dir / "scalers" / "GBPUSD.pkl").write_text("gbpusd-v1")
+    mv.record_version(tmp_path, v1_dir, {})
+
+    mv.promote(tmp_path, "v1")
+
+    live_scalers = tmp_path / "scalers"
+    assert (live_scalers / "EURUSD.pkl").read_text() == "eurusd-v1"
+    assert (live_scalers / "GBPUSD.pkl").read_text() == "gbpusd-v1"
+
+    v2_dir = tmp_path / "versions" / "v2"
+    _write_artifacts(v2_dir, content="two")
+    (v2_dir / "scalers").mkdir(parents=True)
+    (v2_dir / "scalers" / "EURUSD.pkl").write_text("eurusd-v2")
+    mv.record_version(tmp_path, v2_dir, {})
+
+    mv.promote(tmp_path, "v2")
+
+    assert (live_scalers / "EURUSD.pkl").read_text() == "eurusd-v2"
+    assert not (live_scalers / "GBPUSD.pkl").exists()  # stale symbol removed
+
+
 def test_prune_below_keep_threshold_is_noop(tmp_path):
     _make_version(tmp_path, "v1", content="one")
     _make_version(tmp_path, "v2", content="two")

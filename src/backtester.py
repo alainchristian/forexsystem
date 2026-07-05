@@ -11,7 +11,10 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 import json
 
-from config.config import BACKTEST, LOGS_DIR
+from config.config import (
+    BACKTEST, LOGS_DIR, BACKTEST_KELLY_FRACTION_MIN, BACKTEST_KELLY_FRACTION_MAX,
+)
+from src.execution_logic import calculate_kelly_fraction
 
 logger = logging.getLogger(__name__)
 
@@ -286,23 +289,20 @@ class Backtester:
         # Calculate Kelly fraction from trade history
         wins = len([t for t in self.trades if t.pnl > 0])
         losses = len(self.trades) - wins
-        
+
         if losses == 0:
-            kelly_fraction = 0.5
+            # No losing trades yet - can't compute an avg_loss, so max out
+            # the allowed fraction rather than divide by an unknown.
+            kelly_fraction = BACKTEST_KELLY_FRACTION_MAX
         else:
             win_rate = wins / len(self.trades)
             avg_win = np.mean([t.pnl for t in self.trades if t.pnl > 0]) if wins > 0 else 0
-            avg_loss = abs(np.mean([t.pnl for t in self.trades if t.pnl < 0])) if losses > 0 else 1
-            
-            if avg_loss == 0:
-                kelly_fraction = 0.5
-            else:
-                # Kelly formula: f* = (bp*w - q) / b
-                kelly_fraction = (avg_win * win_rate - avg_loss * (1 - win_rate)) / (avg_win + 1e-10)
-        
-        # Apply safety constraints
-        kelly_fraction = max(0.01, min(0.2, kelly_fraction))  # Clamp 1-20% Kelly
-        
+            avg_loss = abs(np.mean([t.pnl for t in self.trades if t.pnl < 0]))
+            kelly_fraction = calculate_kelly_fraction(
+                win_rate, avg_win, avg_loss,
+                min_frac=BACKTEST_KELLY_FRACTION_MIN, max_frac=BACKTEST_KELLY_FRACTION_MAX,
+            )
+
         risk_dollars = self.capital * kelly_fraction
         # Convert USD to lots (assuming standard 100k lot size)
         position_size = risk_dollars / entry_price / 100

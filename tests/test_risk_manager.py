@@ -32,6 +32,28 @@ def test_calculate_position_size_max_constraint():
     size = manager.calculate_position_size(1.0500, 1.0498)
     assert size == 25.0  # Capped at 5%
 
+def test_calculate_position_size_applies_kelly_multiplier_when_history_given():
+    """historical_trades isn't wired in from main.py yet (a separate,
+    deliberate follow-up), so this is the first real exercise of the Kelly
+    branch - confirms it actually multiplies the base size rather than
+    being dead code that happens to never raise."""
+    config = RiskConfig(account_equity=10000.0, risk_per_trade=0.01)
+    manager = RiskManager(config)
+
+    # Entry/SL -> 20 pips risk, base size = ($100 risk) / (20 pips * $10/pip) = 0.5 lots
+    base_size = manager.calculate_position_size(entry_price=1.0500, stop_loss_price=1.0480)
+    assert base_size == 0.5
+
+    # 12 trades, 8 wins @ +$50, 4 losses @ -$30 -> win_rate=2/3, avg_win=50, avg_loss=30
+    # kelly = (2/3*50 - 1/3*30) / 50 = (33.33 - 10) / 50 = 0.4667 -> clamped to [0.5, 1.5] => 0.5
+    historical_trades = [{"pnl": 50.0}] * 8 + [{"pnl": -30.0}] * 4
+    kelly_adjusted = manager.calculate_position_size(
+        entry_price=1.0500, stop_loss_price=1.0480, historical_trades=historical_trades
+    )
+
+    assert kelly_adjusted == round(base_size * 0.5, 2)
+
+
 def test_can_open_trade_circuit_breakers():
     """Test daily loss, drawdown, and global open-trades circuit breakers.
 

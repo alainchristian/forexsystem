@@ -6,6 +6,8 @@ Modular calculation of technical indicators and price-action features
 import numpy as np
 import pandas as pd
 import logging
+import pickle
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from sklearn.preprocessing import StandardScaler
 import traceback
@@ -442,6 +444,20 @@ class FeatureEngine:
             logger.error(f"Normalization error: {e}")
             raise
     
+    def save_scaler(self, filepath: str) -> None:
+        """Persist this engine's fitted scaler so a later inference-time
+        FeatureEngine can transform with the exact statistics training used,
+        instead of re-fitting on whatever small window happens to be live."""
+        if self.scaler is None:
+            raise ValueError("Cannot save an unfit scaler — call normalize(fit=True) first")
+        save_scaler(self.scaler, filepath)
+
+    def load_scaler(self, filepath: str) -> 'FeatureEngine':
+        """Load a previously-fitted scaler so normalize(fit=False) transforms
+        against training-time statistics rather than fitting fresh ones."""
+        self.scaler = load_scaler(filepath)
+        return self
+
     def get_features(self, normalized: bool = False) -> pd.DataFrame:
         """
         Get feature matrix
@@ -468,10 +484,27 @@ class FeatureEngine:
 
 
 # ============================================================================
+# SCALER PERSISTENCE
+# ============================================================================
+
+def save_scaler(scaler: StandardScaler, filepath: str) -> None:
+    """Persist a fitted feature scaler to disk. Creates parent dirs."""
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "wb") as f:
+        pickle.dump(scaler, f)
+
+
+def load_scaler(filepath: str) -> StandardScaler:
+    """Load a previously-fitted feature scaler from disk."""
+    with open(filepath, "rb") as f:
+        return pickle.load(f)
+
+
+# ============================================================================
 # HELPER FUNCTION
 # ============================================================================
 
-def engineer_features(df: pd.DataFrame, 
+def engineer_features(df: pd.DataFrame,
                      normalize: bool = True,
                      config: Dict = FEATURES) -> Tuple[pd.DataFrame, FeatureEngine]:
     """

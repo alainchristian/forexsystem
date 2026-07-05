@@ -62,6 +62,13 @@ Equity: ${report.get('equity', 0):.2f}
         except Exception as e:
             self.logger.error(f"Telegram setup failed: {e}")
 
+    def _is_authorized(self, update: Update) -> bool:
+        """Single-operator bot: the only authorized chat is the one this
+        notifier was configured to alert (self.chat_id). No multi-user
+        allowlist needed for a personal bot."""
+        chat = update.effective_chat
+        return chat is not None and str(chat.id) == str(self.chat_id)
+
     async def shutdown(self):
         """Shutdown the Telegram bot cleanly"""
         if self.app:
@@ -71,6 +78,10 @@ Equity: ${report.get('equity', 0):.2f}
             self.logger.info("Telegram Notifier shut down")
     
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            self.logger.warning(f"Unauthorized /status attempt from chat {update.effective_chat.id if update.effective_chat else '?'}")
+            return
+
         trader = context.bot_data.get('trader')
         if not trader:
             return
@@ -88,6 +99,10 @@ Open Trades: {account_info.get('open_positions', 0)}
         await update.message.reply_text(msg, parse_mode='HTML')
     
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            self.logger.warning(f"Unauthorized /positions attempt from chat {update.effective_chat.id if update.effective_chat else '?'}")
+            return
+
         trader = context.bot_data.get('trader')
         if not trader:
             return
@@ -104,6 +119,10 @@ Open Trades: {account_info.get('open_positions', 0)}
         await update.message.reply_text(msg, parse_mode='HTML')
     
     async def cmd_close_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            self.logger.warning(f"Unauthorized /close attempt from chat {update.effective_chat.id if update.effective_chat else '?'}")
+            return
+
         if not context.args:
             await update.message.reply_text("Usage: /close <order_id>")
             return
@@ -119,6 +138,10 @@ Open Trades: {account_info.get('open_positions', 0)}
             await update.message.reply_text(f"❌ Could not close position #{order_id}")
     
     async def cmd_emergency_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_authorized(update):
+            self.logger.warning(f"Unauthorized /stop attempt from chat {update.effective_chat.id if update.effective_chat else '?'}")
+            return
+
         trader = context.bot_data.get('trader')
         if not trader:
             return

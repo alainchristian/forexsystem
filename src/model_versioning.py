@@ -1,10 +1,12 @@
 """Timestamped versioning for the model artifacts under models/.
 
 main.py always loads from the fixed models/ path (lstm_model.keras,
-lstm_scaler.pkl, xgboost_model.json, xgboost_meta.pkl). This module keeps a
-history of every trained version under models/versions/<id>/ and promotes
-one of them into that fixed path, so a bad retrain can be rolled back
-instead of silently overwriting the working model with no way back.
+lstm_scaler.pkl, xgboost_model.json, xgboost_meta.pkl) plus the per-symbol
+feature scalers under models/scalers/. This module keeps a history of every
+trained version under models/versions/<id>/ and promotes one of them into
+that fixed path — including its scalers/ subdirectory — so a bad retrain
+can be rolled back instead of silently overwriting the working model (or
+leaving stale feature scalers behind) with no way back.
 """
 import json
 import logging
@@ -72,6 +74,22 @@ def promote(models_dir: Path, version_id: str) -> None:
         tmp_dest = models_dir / f"{f}.tmp"
         shutil.copy2(version_dir / f, tmp_dest)
         tmp_dest.replace(models_dir / f)
+
+    # Feature scalers: replace the *entire* live set with this version's, so a
+    # symbol dropped from training (or renamed) doesn't leave a stale live
+    # scaler behind that would silently reintroduce train/serve skew for it.
+    version_scalers_dir = version_dir / "scalers"
+    live_scalers_dir = models_dir / "scalers"
+    if version_scalers_dir.exists():
+        live_scalers_dir.mkdir(parents=True, exist_ok=True)
+        version_files = {p.name for p in version_scalers_dir.glob("*.pkl")}
+        for name in version_files:
+            tmp_dest = live_scalers_dir / f"{name}.tmp"
+            shutil.copy2(version_scalers_dir / name, tmp_dest)
+            tmp_dest.replace(live_scalers_dir / name)
+        for existing in live_scalers_dir.glob("*.pkl"):
+            if existing.name not in version_files:
+                existing.unlink()
 
     manifest = _load_manifest(models_dir)
     manifest["active"] = version_id

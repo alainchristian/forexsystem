@@ -23,6 +23,12 @@ CONFIG_DIR = BASE_DIR / 'config'
 for directory in [MODELS_DIR, LOGS_DIR, DATA_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
+# Per-symbol feature scalers persisted by train_models.py, promoted by
+# model_versioning.promote() alongside the model artifacts so a rollback can
+# never leave scalers out of sync with the live model. main.py refuses to
+# trade any symbol whose scaler is missing here.
+FEATURE_SCALER_DIR = MODELS_DIR / 'scalers'
+
 # ============================================================================
 # DATABASE CONFIGURATION
 # ============================================================================
@@ -285,6 +291,37 @@ MIN_REPLACEMENT_PROFIT: float = 0.0  # position must not be at a loss to be repl
 # unconfirmed. Kept low — a daily-loss breaker silently running on
 # incomplete data is worse than a noisy alert.
 PNL_RECONCILE_ALERT_INTERVAL: int = 5
+
+# How long to wait for the SignalBridge EA to write a result.json response to
+# a bridge-mode order/CLOSE/MODIFY_SL signal before treating it as failed or
+# timed out. Used by submit_order, close_position, and modify_position_sl so
+# all three bridge actions behave consistently.
+BRIDGE_RESULT_TIMEOUT_SECONDS: int = 30
+
+# Kelly-fraction clamps used by calculate_kelly_fraction() (execution_logic.py).
+# Both risk_manager.py and backtester.py share the same underlying formula,
+# but apply the result differently, so they keep separate clamp ranges:
+# risk_manager.py uses its pair as a *multiplier* on a flat 1%-of-equity base
+# position size; backtester.py uses its pair *directly* as the risk-fraction
+# of capital. Sharing one clamp range between the two would silently change
+# real sizing behavior in whichever place didn't originally use it.
+RISK_KELLY_MULTIPLIER_MIN: float = 0.5   # 0.5x-1.5x Kelly multiplier (risk_manager.py)
+RISK_KELLY_MULTIPLIER_MAX: float = 1.5
+BACKTEST_KELLY_FRACTION_MIN: float = 0.01  # 1%-20% of capital directly (backtester.py)
+BACKTEST_KELLY_FRACTION_MAX: float = 0.20
+
+# Trailing stop: once profit exceeds 2x initial risk, lock in this many pips
+# beyond entry (in the trade's favor). Previously a flat 0.005 price-unit
+# offset — 50 pips on non-JPY pairs, 0.5 pips on JPY pairs — this makes the
+# lock-in distance consistent in pips across all pair types.
+TRAILING_STOP_LOCK_PIPS: float = 5.0
+
+# Bridge mode has no live spread data today — SignalBridge.mq5 (on the VPS,
+# not in this repo) doesn't report it. Keep this False until that EA is
+# updated to write a per-symbol tick/spread file; flipping it on before then
+# would reject every single bridge-mode trade (fail-loud with no data available
+# is the intended behavior once the EA is updated, but not before).
+BRIDGE_SPREAD_CHECK_ENABLED: bool = False
 
 # ============================================================================
 # DATA PIPELINE CONFIGURATION

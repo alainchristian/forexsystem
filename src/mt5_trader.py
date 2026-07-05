@@ -14,7 +14,10 @@ except ImportError:
     MT5_AVAILABLE = False
     print("Warning: MetaTrader5 module not installed.")
 
-from config.config import TRADE_COOLDOWN_SECONDS, SYMBOLS, PNL_RECONCILE_ALERT_INTERVAL
+from config.config import (
+    TRADE_COOLDOWN_SECONDS, SYMBOLS, PNL_RECONCILE_ALERT_INTERVAL,
+    BRIDGE_RESULT_TIMEOUT_SECONDS, BRIDGE_SPREAD_CHECK_ENABLED,
+)
 
 BRIDGE_DIR = Path(
     r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\Common\Files\forex_bridge"
@@ -123,7 +126,7 @@ class MT5Trader:
             json.dumps(payload), encoding="utf-8"
         )
 
-    async def _bridge_wait_result(self, signal_id: str, timeout: int = 30) -> Optional[dict]:
+    async def _bridge_wait_result(self, signal_id: str, timeout: int = BRIDGE_RESULT_TIMEOUT_SECONDS) -> Optional[dict]:
         """Wait for result.json to contain a response for signal_id."""
         result_file = BRIDGE_DIR / "result.json"
         deadline = time.time() + timeout
@@ -143,6 +146,22 @@ class MT5Trader:
             return json.loads((BRIDGE_DIR / "account.json").read_text(encoding="utf-8"))
         except Exception:
             return {}
+
+    def _bridge_tick(self, symbol: str) -> Optional[dict]:
+        """Returns None if ticks.json is missing/unreadable or has no entry
+        for symbol, distinguishing "no spread data available" from "spread
+        happens to be reported as 0" - same convention as _bridge_positions().
+
+        Expects the EA to write a dict keyed by symbol, e.g.
+        {"EURUSD": {"spread": 0.00012}, ...}. SignalBridge.mq5 doesn't write
+        this file yet — it needs updating on the VPS before
+        BRIDGE_SPREAD_CHECK_ENABLED can be turned on.
+        """
+        try:
+            data = json.loads((BRIDGE_DIR / "ticks.json").read_text(encoding="utf-8"))
+            return data.get(symbol)
+        except Exception:
+            return None
 
     def _bridge_positions(self) -> Optional[list]:
         """Returns None (not []) if positions.json couldn't be read/parsed,
@@ -242,7 +261,7 @@ class MT5Trader:
             self.logger.warning(f"Invalid setup: {validation['reason']}")
             return None
 
-        # --- Spread check (IPC mode only) ---
+        # --- Spread check ---
         if not self._bridge_mode and MT5_AVAILABLE and symbol in SYMBOLS:
             tick = mt5.symbol_info_tick(symbol)
             if tick:
@@ -251,6 +270,15 @@ class MT5Trader:
                 if live_spread > max_spread:
                     self.logger.warning(f"Spread too wide {symbol}: {live_spread:.5f} > {max_spread:.5f}")
                     return None
+        elif self._bridge_mode and BRIDGE_SPREAD_CHECK_ENABLED and symbol in SYMBOLS:
+            tick = self._bridge_tick(symbol)
+            if tick is None or "spread" not in tick:
+                self.logger.error(f"Bridge spread check enabled but no spread data for {symbol} — rejecting trade")
+                return None
+            max_spread = SYMBOLS[symbol].get("max_spread", float("inf"))
+            if tick["spread"] > max_spread:
+                self.logger.warning(f"Spread too wide {symbol} (bridge): {tick['spread']:.5f} > {max_spread:.5f}")
+                return None
 
         # --- Margin check ---
         if not self._bridge_mode and MT5_AVAILABLE:
@@ -450,8 +478,12 @@ class MT5Trader:
             self._bridge_write({"id": sig_id, "action": "CLOSE",
                                 "symbol": pos["symbol"], "ticket": order_id,
                                 "volume": pos["volume"], "entry": 0, "sl": 0, "tp": 0})
-            # Fire-and-forget — we can't easily await here without making this async
-            time.sleep(6)
+            result = await self._bridge_wait_result(sig_id, timeout=BRIDGE_RESULT_TIMEOUT_SECONDS)
+            if result is None or result.get("status") != "OK":
+                err = result.get("error", "timeout") if result else "timeout"
+                self.logger.error(f"Bridge close failed for #{order_id} ({pos['symbol']}): {err}")
+                await self.telegram.send_alert(f"❌ Close failed (#{order_id} {pos['symbol']}): {err}")
+                return False
             ok = True
         else:
             tick = mt5.symbol_info_tick(pos["symbol"])
@@ -513,7 +545,7 @@ class MT5Trader:
             )
         return ok
 
-    def modify_position_sl(self, order_id: int, new_sl: float) -> bool:
+    async def modify_position_sl(self, order_id: int, new_sl: float) -> bool:
         if not self.mt5_initialized or order_id not in self.open_positions:
             return False
         pos = self.open_positions[order_id]
@@ -526,7 +558,12 @@ class MT5Trader:
                 "sl": round(float(new_sl), 5), "tp": round(float(pos["tp"]), 5),
                 "volume": 0, "entry": 0,
             })
-            time.sleep(6)
+            result = await self._bridge_wait_result(sig_id, timeout=BRIDGE_RESULT_TIMEOUT_SECONDS)
+            if result is None or result.get("status") != "OK":
+                err = result.get("error", "timeout") if result else "timeout"
+                self.logger.error(f"Bridge SL modify failed for #{order_id} ({pos['symbol']}): {err}")
+                await self.telegram.send_alert(f"⚠️ SL modify failed (#{order_id} {pos['symbol']}): {err}")
+                return False
             pos["sl"] = new_sl
             return True
         else:
