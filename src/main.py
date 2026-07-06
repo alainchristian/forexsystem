@@ -25,6 +25,7 @@ from src.risk_manager import RiskManager, RiskConfig
 from src.telegram_bot import TelegramNotifier
 from src.mt5_trader import MT5Trader
 from src import db
+from src import risk_state
 
 from src.models.lstm_predictor import LSTMPredictor
 from src.models.xgboost_classifier import XGBoostSignal
@@ -55,12 +56,18 @@ class TradingSystem:
     def __init__(self, config: Dict):
         self.config = config
 
+        try:
+            risk_state.create_table()
+        except Exception as e:
+            logger.error(f"Could not create risk_state table: {e} — peak_equity/daily_pnl "
+                         f"persistence across restarts will be unavailable until this is fixed")
+
         self.risk_mgr = RiskManager(RiskConfig(
             account_equity=config['initial_capital'],
             risk_per_trade=config['risk_per_trade'],
             max_daily_loss_pct=config['max_daily_loss'],
             max_open_trades=config['max_open_trades']
-        ))
+        ), on_state_changed=self._persist_risk_state)
 
         self.telegram = TelegramNotifier(
             bot_token=config['telegram_token'],
@@ -118,9 +125,62 @@ class TradingSystem:
             )
             sys.exit(1)
 
-        # In-memory price cache used as Redis fallback for trailing stops
+        # In-memory price cache for trailing stops — absorbs a single
+        # transient get_current_price() failure without losing the last
+        # known-good price.
         self._price_cache: Dict[str, float] = {}
-        self._redis_available: bool = True
+        # Last time each symbol's price cache was successfully refreshed, and
+        # the last time a stale-price alert was sent for it — used to detect
+        # positions with no live price data (see update_trailing_stops).
+        self._price_cache_updated_at: Dict[str, datetime] = {}
+        self._price_cache_last_alert: Dict[str, datetime] = {}
+
+    def _persist_risk_state(self, peak_equity: float, daily_pnl: float) -> None:
+        """RiskManager's on_state_changed hook - persists so a restart doesn't
+        silently reset the drawdown/daily-loss circuit breakers' memory (see
+        src/risk_state.py). Logs rather than raises on failure - a persistence
+        hiccup must never interrupt live trading."""
+        if not risk_state.save(peak_equity, daily_pnl, datetime.utcnow().date()):
+            logger.error("Failed to persist risk state (peak_equity/daily_pnl) — see risk_state.save log above")
+
+    async def _sync_account_and_risk_state(self) -> None:
+        """Sync RiskManager's account_equity/peak_equity/daily_pnl with live MT5
+        equity and any persisted risk state at startup. Restoring peak_equity/
+        daily_pnl from risk_state.load() (rather than always re-deriving
+        peak_equity from live equity) is what keeps the drawdown/daily-loss
+        circuit breakers' memory intact across a crash/restart."""
+        acc_info = self.trader.get_account_info()
+        if not (acc_info and acc_info.get('equity', 0) > 0):
+            logger.info(f"Account equity unavailable — using initial_capital: ${self.config['initial_capital']:.2f}")
+            return
+
+        logger.info(f"Syncing Risk Manager with live MT5 equity: ${acc_info['equity']:.2f}")
+        self.risk_mgr.config.account_equity = acc_info['equity']
+
+        try:
+            persisted = risk_state.load()
+        except risk_state.RiskStateUnavailable as e:
+            persisted = None
+            logger.error(f"Risk state DB unavailable at startup: {e}")
+            await self.telegram.send_alert(
+                "⚠️ Risk state DB unavailable at startup — peak_equity/daily_pnl "
+                "circuit breakers are starting from live equity only, not their "
+                "persisted historical values."
+            )
+
+        if persisted:
+            # All-time high-water mark: never let a restart's live equity reading
+            # count as a new peak lower than one already recorded.
+            self.risk_mgr.peak_equity = max(persisted['peak_equity'], acc_info['equity'])
+            if persisted['daily_pnl_date'] == datetime.utcnow().date():
+                self.risk_mgr.daily_pnl = persisted['daily_pnl']
+            # else: date has rolled over since the last save - leave daily_pnl at
+            # 0.0. This also self-heals a missed daily reset (reset_daily_stats()
+            # only fires in a 1-minute UTC window; if the bot was down then, this
+            # catches it on the next restart instead of carrying yesterday's P&L
+            # forward indefinitely).
+        else:
+            self.risk_mgr.peak_equity = acc_info['equity']  # genuine first run
 
     async def run(self):
         """Main trading loop"""
@@ -132,13 +192,7 @@ class TradingSystem:
             if not self.config.get('mock_mode', False):
                 return
         else:
-            acc_info = self.trader.get_account_info()
-            if acc_info and acc_info.get('equity', 0) > 0:
-                logger.info(f"Syncing Risk Manager with live MT5 equity: ${acc_info['equity']:.2f}")
-                self.risk_mgr.config.account_equity = acc_info['equity']
-                self.risk_mgr.peak_equity = acc_info['equity']
-            else:
-                logger.info(f"Account equity unavailable — using initial_capital: ${self.config['initial_capital']:.2f}")
+            await self._sync_account_and_risk_state()
 
             # Recover any positions that survived a previous crash
             await self._reconcile_positions()
@@ -521,39 +575,48 @@ class TradingSystem:
             logger.error(f"Symbol processing error ({symbol}): {e}", exc_info=True)
 
     async def update_trailing_stops(self):
-        """Adjust SL for profitable trades using Redis price feed, with local cache fallback."""
-        import redis
-
-        r = None
-        try:
-            r = redis.Redis(**cfg.REDIS)
-            r.ping()
-            if not self._redis_available:
-                logger.info("Redis reconnected — trailing stops resuming from live feed")
-            self._redis_available = True
-        except Exception:
-            if self._redis_available:
-                logger.warning("Redis unavailable — trailing stops falling back to local price cache")
-            self._redis_available = False
+        """Adjust SL for profitable trades using a live price pulled directly
+        from MT5Trader, with a short-lived local cache fallback for a single
+        transient tick-fetch failure."""
+        missing_price_symbols = []
 
         for order_id, pos in list(self.trader.open_positions.items()):
             symbol = pos['symbol']
-            current_price = None
+            current_price = self.trader.get_current_price(symbol)
 
-            if r is not None:
-                try:
-                    price_str = r.get(f"{symbol}:240:latest_price")
-                    if price_str:
-                        current_price = float(price_str)
-                        self._price_cache[symbol] = current_price
-                except Exception:
-                    pass
-
-            if current_price is None:
+            if current_price is not None:
+                self._price_cache[symbol] = current_price
+                self._price_cache_updated_at[symbol] = datetime.now()
+            else:
                 current_price = self._price_cache.get(symbol)
 
             if current_price is None:
+                missing_price_symbols.append(symbol)
+                # Never had a successful cache write — measure staleness from
+                # when the position opened rather than from an unset time.
+                last_known = self._price_cache_updated_at.get(symbol, pos['opened_at'])
+                stale_minutes = (datetime.now() - last_known).total_seconds() / 60
+                if stale_minutes >= cfg.PRICE_CACHE_STALE_ALERT_MINUTES:
+                    last_alert = self._price_cache_last_alert.get(symbol)
+                    should_alert = (
+                        last_alert is None
+                        or (datetime.now() - last_alert).total_seconds() / 60
+                        >= cfg.PRICE_CACHE_STALE_ALERT_MINUTES
+                    )
+                    if should_alert:
+                        logger.error(
+                            f"No cached price for {symbol} (#{order_id}) in {stale_minutes:.1f} min "
+                            f"— trailing-stop protection is not active for this position"
+                        )
+                        await self.telegram.send_alert(
+                            f"⚠️ <b>NO PRICE DATA</b> — {symbol} #{order_id}\n"
+                            f"No cached price for {stale_minutes:.1f} min. Trailing-stop protection "
+                            f"is not active for this position."
+                        )
+                        self._price_cache_last_alert[symbol] = datetime.now()
                 continue
+
+            self._price_cache_last_alert.pop(symbol, None)
 
             profit = (
                 (current_price - pos['entry']) * pos['volume']
@@ -579,6 +642,12 @@ class TradingSystem:
                         )
                     else:
                         logger.warning(f"Failed to update trailing SL for #{order_id}")
+
+        if missing_price_symbols:
+            logger.warning(
+                f"{len(missing_price_symbols)} open position(s) with no cached price: "
+                f"{missing_price_symbols}"
+            )
 
     async def send_daily_report(self):
         """Send end-of-day metrics via Telegram."""

@@ -644,3 +644,75 @@ def test_submit_order_bridge_allows_when_spread_ok(mock_dependencies):
         order_id = _submit(trader)
 
     assert order_id == 999
+
+
+# ----------------------------------------------------------------------------
+# get_current_price — used by main.py's update_trailing_stops() as the live
+# price source (replacing a Redis key that nothing in this repo ever wrote)
+# ----------------------------------------------------------------------------
+
+@patch('src.mt5_trader.mt5')
+def test_get_current_price_real_ipc_returns_bid_ask_mid(mock_mt5, mock_dependencies):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = False
+
+    mock_mt5.symbol_info_tick.return_value = MagicMock(bid=1.1000, ask=1.1002)
+
+    with patch('src.mt5_trader.MT5_AVAILABLE', True):
+        price = trader.get_current_price("EURUSD")
+
+    assert price == pytest.approx(1.1001)
+
+
+@patch('src.mt5_trader.mt5')
+def test_get_current_price_real_ipc_returns_none_when_no_tick(mock_mt5, mock_dependencies):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = False
+
+    mock_mt5.symbol_info_tick.return_value = None
+
+    with patch('src.mt5_trader.MT5_AVAILABLE', True):
+        price = trader.get_current_price("EURUSD")
+
+    assert price is None
+
+
+def test_get_current_price_bridge_mode_returns_mid_when_ticks_available(mock_dependencies):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = True
+    trader._bridge_tick = MagicMock(return_value={"bid": 1.1000, "ask": 1.1002})
+
+    price = trader.get_current_price("EURUSD")
+
+    assert price == pytest.approx(1.1001)
+
+
+def test_get_current_price_bridge_mode_returns_none_when_ea_has_no_tick_data():
+    """SignalBridge.mq5 (on the VPS, not in this repo) doesn't write per
+    -symbol tick prices to ticks.json yet - same known gap as
+    BRIDGE_SPREAD_CHECK_ENABLED. Must return None (not raise, not a stale
+    guess) until the EA is updated."""
+    risk_mgr = RiskManager(RiskConfig(account_equity=10000.0))
+    telegram = AsyncMock()
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = True
+    trader._bridge_mode = True
+    trader._bridge_tick = MagicMock(return_value=None)
+
+    price = trader.get_current_price("EURUSD")
+
+    assert price is None
+
+
+def test_get_current_price_returns_none_when_not_initialized(mock_dependencies):
+    risk_mgr, telegram = mock_dependencies
+    trader = MT5Trader(123, 'pass', 'server', risk_mgr, telegram)
+    trader.mt5_initialized = False
+
+    assert trader.get_current_price("EURUSD") is None

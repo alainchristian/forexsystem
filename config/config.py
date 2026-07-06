@@ -292,6 +292,14 @@ MIN_REPLACEMENT_PROFIT: float = 0.0  # position must not be at a loss to be repl
 # incomplete data is worse than a noisy alert.
 PNL_RECONCILE_ALERT_INTERVAL: int = 5
 
+# Once any pending_pnl entry (see mt5_trader.queue_pnl_reconciliation) has been
+# unconfirmed longer than this, can_open_trade() hard-blocks new trades rather
+# than just alerting — the daily-loss/drawdown breakers read daily_pnl, which
+# is unreliable while a close is unreconciled. This is a hard AGE CUTOFF (new
+# trades resume once the entry ages back out or reconciles), not a "block
+# until reconciled" policy — flag to Alain if the latter is preferred instead.
+MAX_UNCONFIRMED_PNL_AGE_MINUTES: float = 15.0
+
 # How long to wait for the SignalBridge EA to write a result.json response to
 # a bridge-mode order/CLOSE/MODIFY_SL signal before treating it as failed or
 # timed out. Used by submit_order, close_position, and modify_position_sl so
@@ -322,6 +330,12 @@ TRAILING_STOP_LOCK_PIPS: float = 5.0
 # would reject every single bridge-mode trade (fail-loud with no data available
 # is the intended behavior once the EA is updated, but not before).
 BRIDGE_SPREAD_CHECK_ENABLED: bool = False
+
+# Trailing-stop price cache (main.py _price_cache): once an open position has
+# gone this long without a successfully cached price (Redis down and no local
+# fallback value yet), repeat a Telegram alert — trailing-stop protection is
+# silently inactive for that position until a price is available again.
+PRICE_CACHE_STALE_ALERT_MINUTES: float = 15.0
 
 # ============================================================================
 # DATA PIPELINE CONFIGURATION

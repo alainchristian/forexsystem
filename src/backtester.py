@@ -12,9 +12,9 @@ from datetime import datetime
 import json
 
 from config.config import (
-    BACKTEST, LOGS_DIR, BACKTEST_KELLY_FRACTION_MIN, BACKTEST_KELLY_FRACTION_MAX,
+    BACKTEST, LOGS_DIR, BACKTEST_KELLY_FRACTION_MIN, BACKTEST_KELLY_FRACTION_MAX, SYMBOLS,
 )
-from src.execution_logic import calculate_kelly_fraction
+from src.execution_logic import calculate_kelly_fraction, dollar_per_pip_per_lot
 
 logger = logging.getLogger(__name__)
 
@@ -35,32 +35,42 @@ class Trade:
     volume: float
     slippage_pips: float
     commission: float
-    
+    symbol: str = None
+
+    @property
+    def _pip_value(self) -> float:
+        """Symbol's pip size, or the USD-pair default (0.0001) when no symbol
+        is set — same fallback risk_manager.calculate_position_size uses."""
+        if self.symbol and self.symbol in SYMBOLS:
+            return SYMBOLS[self.symbol]['pip_value']
+        return 0.0001
+
     @property
     def risk_pips(self) -> float:
         """Risk in pips"""
-        return abs(self.entry_price - self.exit_price) * 10000
-    
+        return abs(self.entry_price - self.exit_price) / self._pip_value
+
+    @property
+    def _pips_moved(self) -> float:
+        """Signed pips moved in the trade's favor."""
+        pip_value = self._pip_value
+        if self.direction == 'LONG':
+            return (self.exit_price - self.entry_price) / pip_value
+        else:
+            return (self.entry_price - self.exit_price) / pip_value
+
     @property
     def pnl_before_costs(self) -> float:
         """P&L before slippage and commission"""
-        if self.direction == 'LONG':
-            return (self.exit_price - self.entry_price) * self.volume * 100000
-        else:
-            return (self.entry_price - self.exit_price) * self.volume * 100000
-    
+        dollar_per_pip = dollar_per_pip_per_lot(self._pip_value, self.entry_price)
+        return self._pips_moved * dollar_per_pip * self.volume
+
     @property
     def pnl(self) -> float:
         """P&L after slippage and commission"""
-        # Slippage acts against the trade (1 pip = 0.0001, so 100000 units * 0.0001 = $10 per pip per lot)
-        slippage_cost = self.slippage_pips * 10 * self.volume
-        
-        if self.direction == 'LONG':
-            return ((self.exit_price - self.entry_price) * self.volume * 100000
-                   - slippage_cost - self.commission)
-        else:
-            return ((self.entry_price - self.exit_price) * self.volume * 100000
-                   - slippage_cost - self.commission)
+        dollar_per_pip = dollar_per_pip_per_lot(self._pip_value, self.entry_price)
+        slippage_cost = self.slippage_pips * dollar_per_pip * self.volume
+        return self.pnl_before_costs - slippage_cost - self.commission
     
     @property
     def pnl_pct(self) -> float:
@@ -102,27 +112,33 @@ class Backtester:
                  initial_capital: float = BACKTEST['initial_capital'],
                  risk_per_trade: float = BACKTEST['initial_margin'],
                  slippage_pips: float = BACKTEST['slippage_pips'],
-                 commission: float = BACKTEST['commission_per_trade']):
+                 commission: float = BACKTEST['commission_per_trade'],
+                 symbol: Optional[str] = None):
         """
         Initialize backtester
-        
+
         Args:
             df: DataFrame with timestamp index and OHLCV columns
             initial_capital: Starting capital in USD
             risk_per_trade: Risk fraction per trade (0.02 = 2%)
             slippage_pips: Fixed slippage in pips
             commission: Fixed commission per trade in USD
+            symbol: Symbol being backtested, used to look up pip_value in
+                SYMBOLS for correct JPY-pair currency conversion. Defaults to
+                None (treated as a USD-quoted pair, pip_value=0.0001) for
+                callers that don't know/care which symbol they're testing.
         """
-        
+
         if df is None or df.empty:
             raise ValueError("DataFrame cannot be empty")
-        
+
         self.df = df.reset_index(drop=True)
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.risk_per_trade = risk_per_trade
         self.slippage_pips = slippage_pips
         self.commission = commission
+        self.symbol = symbol
         
         # Trading state
         self.trades: List[Trade] = []
@@ -249,12 +265,13 @@ class Backtester:
             return
         
         # Add slippage to exit price
-        slippage_adjustment = (self.slippage_pips / 10000)
+        pip_value = SYMBOLS[self.symbol]['pip_value'] if self.symbol and self.symbol in SYMBOLS else 0.0001
+        slippage_adjustment = self.slippage_pips * pip_value
         if self.position['direction'] == 'LONG':
             exit_price = row['close'] - slippage_adjustment
         else:
             exit_price = row['close'] + slippage_adjustment
-        
+
         trade = Trade(
             entry_idx=self.position['entry_idx'],
             entry_time=self.position['entry_time'],
@@ -265,7 +282,8 @@ class Backtester:
             direction=self.position['direction'],
             volume=self.position['volume'],
             slippage_pips=self.slippage_pips,
-            commission=self.commission
+            commission=self.commission,
+            symbol=self.symbol
         )
         
         self.trades.append(trade)

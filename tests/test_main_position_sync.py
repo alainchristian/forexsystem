@@ -1,5 +1,6 @@
 import sys
 import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,6 +26,9 @@ def _bare_trading_system(open_positions: dict):
     system.trader.open_positions = open_positions
     system.trader.get_closed_pnl = AsyncMock(return_value=10.0)
     system.trader.queue_pnl_reconciliation = MagicMock()
+    system._price_cache = {}
+    system._price_cache_updated_at = {}
+    system._price_cache_last_alert = {}
     return system
 
 
@@ -88,11 +92,9 @@ def test_trailing_stop_offset_differs_correctly_between_jpy_and_non_jpy():
             "entry": entry, "sl": sl, "opened_at": None,
         }
         system = _bare_trading_system({order_id: position})
-        system._redis_available = False
-        system._price_cache = {symbol: current_price}
+        system.trader.get_current_price = MagicMock(return_value=current_price)
         system.trader.modify_position_sl = AsyncMock(return_value=True)
-        with patch("redis.Redis", side_effect=ConnectionError("no redis in tests")):
-            await system.update_trailing_stops()
+        await system.update_trailing_stops()
         return system.trader.modify_position_sl
 
     # EURUSD: entry 1.1000, sl 1.0950 (50 pip risk), price rallies to 1.1300
@@ -127,14 +129,143 @@ def test_update_trailing_stops_awaits_modify_position_sl():
         "entry": 1.1000, "sl": 1.0950, "opened_at": None,
     }
     system = _bare_trading_system({order_id: position})
-    system._redis_available = False
-    system._price_cache = {"EURUSD": 1.1200}  # profit = 0.02 * 1.0 = 0.02 > 2*initial_risk (0.01)
+    system.trader.get_current_price = MagicMock(return_value=1.1200)  # profit = 0.02*1.0 > 2*initial_risk (0.01)
     system.trader.modify_position_sl = AsyncMock(return_value=True)
 
-    # update_trailing_stops() tries a real Redis connection first; force it
-    # to fail fast instead of hitting socket_connect_timeout against a
-    # Redis that isn't running in the test environment.
-    with patch("redis.Redis", side_effect=ConnectionError("no redis in tests")):
-        asyncio.run(system.update_trailing_stops())
+    asyncio.run(system.update_trailing_stops())
 
     system.trader.modify_position_sl.assert_awaited_once()
+
+
+def test_update_trailing_stops_alerts_when_price_never_cached_past_threshold(caplog):
+    """get_current_price() failing from the start (no prior successful cache
+    write - e.g. bridge mode with no tick data, or MT5 IPC returning no tick)
+    with an open position whose age already exceeds
+    PRICE_CACHE_STALE_ALERT_MINUTES must both log distinctly per-symbol and
+    fire the repeating Telegram alert - trailing-stop protection is silently
+    inactive otherwise."""
+    from config.config import PRICE_CACHE_STALE_ALERT_MINUTES
+
+    order_id = 777
+    position = {
+        "symbol": "EURUSD", "direction": 1, "volume": 1.0,
+        "entry": 1.1000, "sl": 1.0950,
+        "opened_at": datetime.now() - timedelta(minutes=PRICE_CACHE_STALE_ALERT_MINUTES + 5),
+    }
+    system = _bare_trading_system({order_id: position})
+    system.trader.get_current_price = MagicMock(return_value=None)  # never successfully fetched
+
+    import logging
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(system.update_trailing_stops())
+
+    system.telegram.send_alert.assert_awaited_once()
+    alert_msg = system.telegram.send_alert.call_args[0][0]
+    assert "EURUSD" in alert_msg
+    assert "NO PRICE DATA" in alert_msg
+    assert any("EURUSD" in record.message for record in caplog.records)
+
+
+def test_update_trailing_stops_no_alert_before_threshold():
+    """A position that just opened (well under PRICE_CACHE_STALE_ALERT_MINUTES)
+    with no fetched price yet must not alert - proves this is a threshold,
+    not an immediate page on every single failed tick fetch."""
+    order_id = 778
+    position = {
+        "symbol": "EURUSD", "direction": 1, "volume": 1.0,
+        "entry": 1.1000, "sl": 1.0950,
+        "opened_at": datetime.now(),
+    }
+    system = _bare_trading_system({order_id: position})
+    system.trader.get_current_price = MagicMock(return_value=None)
+
+    asyncio.run(system.update_trailing_stops())
+
+    system.telegram.send_alert.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------------
+# _sync_account_and_risk_state — persisted peak_equity/daily_pnl surviving a
+# restart (see src/risk_state.py). These exercise a genuinely separate
+# risk_state.load() call, not just object construction, to prove the restored
+# values actually come from "persistence", not from the RiskManager default.
+# ----------------------------------------------------------------------------
+
+def _system_for_risk_state_sync(equity=9000.0, initial_capital=10000.0):
+    system = _bare_trading_system({})
+    system.config = {"initial_capital": initial_capital}
+    system.trader.get_account_info = MagicMock(return_value={"equity": equity})
+    return system
+
+
+def test_sync_restores_persisted_peak_equity_higher_than_live_equity():
+    """A peak recorded before a crash (12000) must survive a restart even
+    though live equity is now lower (9000, e.g. after a drawdown) - this is
+    the exact scenario the bug report describes: without this fix, peak_equity
+    would silently reset to 9000 and the drawdown breaker would read 0%
+    instead of the real ~25%."""
+    system = _system_for_risk_state_sync(equity=9000.0)
+    persisted = {"peak_equity": 12000.0, "daily_pnl": -300.0, "daily_pnl_date": datetime.utcnow().date()}
+
+    with patch("src.main.risk_state") as mock_risk_state:
+        mock_risk_state.load.return_value = persisted
+        asyncio.run(system._sync_account_and_risk_state())
+
+    assert system.risk_mgr.config.account_equity == 9000.0
+    assert system.risk_mgr.peak_equity == 12000.0
+    assert system.risk_mgr.daily_pnl == -300.0
+
+
+def test_sync_daily_pnl_survives_same_day_restart():
+    system = _system_for_risk_state_sync(equity=9700.0)
+    persisted = {"peak_equity": 10000.0, "daily_pnl": -450.0, "daily_pnl_date": datetime.utcnow().date()}
+
+    with patch("src.main.risk_state") as mock_risk_state:
+        mock_risk_state.load.return_value = persisted
+        asyncio.run(system._sync_account_and_risk_state())
+
+    assert system.risk_mgr.daily_pnl == -450.0
+
+
+def test_sync_ignores_stale_daily_pnl_date_from_a_previous_day():
+    """A persisted daily_pnl from a prior day (the reset window was missed
+    while the bot was down) must NOT be restored - it should be treated as
+    expired, self-healing the missed reset instead of carrying yesterday's
+    P&L forward."""
+    system = _system_for_risk_state_sync(equity=9700.0)
+    yesterday = (datetime.utcnow() - timedelta(days=1)).date()
+    persisted = {"peak_equity": 10000.0, "daily_pnl": -450.0, "daily_pnl_date": yesterday}
+
+    with patch("src.main.risk_state") as mock_risk_state:
+        mock_risk_state.load.return_value = persisted
+        asyncio.run(system._sync_account_and_risk_state())
+
+    assert system.risk_mgr.daily_pnl == 0.0  # unchanged from construction default
+
+
+def test_sync_first_run_uses_live_equity_as_peak_when_no_persisted_state():
+    system = _system_for_risk_state_sync(equity=9700.0)
+
+    with patch("src.main.risk_state") as mock_risk_state:
+        mock_risk_state.load.return_value = None
+        asyncio.run(system._sync_account_and_risk_state())
+
+    assert system.risk_mgr.peak_equity == 9700.0
+
+
+def test_sync_alerts_and_falls_back_when_risk_state_db_unavailable():
+    """A DB outage at exactly the restart moment must not silently reproduce
+    the original bug - it should alert loudly (matching the pending_pnl /
+    price-cache alert pattern) rather than pretend nothing is wrong."""
+    from src import risk_state as real_risk_state
+
+    system = _system_for_risk_state_sync(equity=9700.0)
+
+    with patch("src.main.risk_state") as mock_risk_state:
+        mock_risk_state.RiskStateUnavailable = real_risk_state.RiskStateUnavailable
+        mock_risk_state.load.side_effect = real_risk_state.RiskStateUnavailable("db down")
+        asyncio.run(system._sync_account_and_risk_state())
+
+    system.telegram.send_alert.assert_awaited_once()
+    assert "DB unavailable" in system.telegram.send_alert.call_args[0][0]
+    assert system.risk_mgr.peak_equity == 9700.0  # falls back to live equity

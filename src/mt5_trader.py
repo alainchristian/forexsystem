@@ -203,7 +203,7 @@ class MT5Trader:
                 self.logger.debug(f"Cooldown {symbol}: {int(TRADE_COOLDOWN_SECONDS-elapsed)}s left")
                 return None
 
-        trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions)
+        trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions, self.pending_pnl)
         if not trade_check["valid"]:
             # Ranked Replacement only makes sense for the global portfolio
             # cap: it frees a slot by closing the globally lowest-confidence
@@ -231,7 +231,7 @@ class MT5Trader:
                 if held_long_enough and confident_enough and not_losing:
                     self.logger.info(f"Ranked replacement: closing #{lowest_id}")
                     await self.close_position(lowest_id, "Ranked Replacement")
-                    trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions)
+                    trade_check = self.risk_mgr.can_open_trade(symbol, float(volume), self.open_positions, self.pending_pnl)
                     if not trade_check["valid"]:
                         return None
                 else:
@@ -600,6 +600,34 @@ class MT5Trader:
             self.logger.warning(f"positions_get() failed: {mt5.last_error()}")
             return None
         return list(positions)
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Current market price (mid of bid/ask) for a symbol.
+
+        Used by main.py's update_trailing_stops() as the live price source.
+        Previously that read a Redis key (`{symbol}:240:latest_price`) that
+        nothing in this codebase ever wrote — data_ingestion.py defines
+        cache_latest_price() but never calls it, so trailing-stop protection
+        was silently dead from day one. This pulls from the same live tick
+        source submit_order()'s spread check already trusts, instead of
+        depending on a cache with no writer.
+
+        Real IPC: mt5.symbol_info_tick(). Bridge mode: SignalBridge.mq5 (on
+        the VPS, not in this repo) doesn't write per-symbol tick prices to
+        ticks.json yet — same known gap as BRIDGE_SPREAD_CHECK_ENABLED.
+        Returns None until the EA is updated with that data.
+        """
+        if not self.mt5_initialized:
+            return None
+        if self._bridge_mode:
+            tick = self._bridge_tick(symbol)
+            if tick and "bid" in tick and "ask" in tick:
+                return (float(tick["bid"]) + float(tick["ask"])) / 2
+            return None
+        tick = mt5.symbol_info_tick(symbol)
+        if tick:
+            return (tick.bid + tick.ask) / 2
+        return None
 
     def _get_live_profit(self, ticket: int) -> Optional[float]:
         """Look up a position's current floating profit/loss from MT5."""

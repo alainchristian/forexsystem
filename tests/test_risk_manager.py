@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 import pytest
 import numpy as np
 
@@ -97,6 +98,86 @@ def test_can_open_trade_circuit_breakers():
     manager.config.account_equity = 8400.0
     manager.daily_pnl = 0.0 # reset daily so it doesn't trip
     assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is False
+
+def test_update_daily_pnl_invokes_on_state_changed_hook_with_current_values():
+    """RiskManager persists peak_equity/daily_pnl via an injected hook rather
+    than importing a DB module directly (keeps this class DB-free and every
+    bare-construction test in this file working with zero mocking)."""
+    calls = []
+    config = RiskConfig(account_equity=10000.0)
+    manager = RiskManager(config, on_state_changed=lambda pe, dp: calls.append((pe, dp)))
+
+    manager.update_daily_pnl(500.0)
+
+    assert calls == [(10500.0, 500.0)]
+
+
+def test_reset_daily_stats_invokes_on_state_changed_hook():
+    """reset_daily_stats() must also fire the hook so a persisted daily_pnl_date
+    tracks the reset - otherwise a later restart on the same day could
+    incorrectly restore the pre-reset value."""
+    calls = []
+    config = RiskConfig(account_equity=10000.0)
+    manager = RiskManager(config, on_state_changed=lambda pe, dp: calls.append((pe, dp)))
+
+    manager.update_daily_pnl(-200.0)
+    manager.reset_daily_stats()
+
+    assert calls[-1] == (10000.0, 0.0)
+
+
+def test_on_state_changed_defaults_to_none_and_is_never_required():
+    """Omitting on_state_changed (today's default, used by every other test in
+    this file) must not raise or otherwise change behavior."""
+    config = RiskConfig(account_equity=10000.0)
+    manager = RiskManager(config)
+
+    manager.update_daily_pnl(100.0)
+    manager.reset_daily_stats()  # must not raise
+
+
+def test_can_open_trade_blocks_when_pending_pnl_stale():
+    """A pending_pnl entry older than max_unconfirmed_pnl_age_minutes must hard
+    -block new trades, even though daily_pnl/peak_equity look fine - those
+    figures are unreliable while a close is still unreconciled (see
+    mt5_trader.queue_pnl_reconciliation / reconcile_pending_pnl)."""
+    config = RiskConfig(account_equity=10000.0, max_unconfirmed_pnl_age_minutes=15.0)
+    manager = RiskManager(config)
+
+    pending_pnl = {
+        123: {"symbol": "EURUSD", "reason": "SL hit", "queued_at": datetime.now() - timedelta(minutes=20), "attempts": 4}
+    }
+
+    result = manager.can_open_trade('GBPUSD', 0.1, {}, pending_pnl)
+    assert result['valid'] is False
+    assert result['reason'] == 'Unconfirmed P&L pending reconciliation'
+
+
+def test_can_open_trade_allows_when_pending_pnl_within_age_cutoff():
+    """A pending_pnl entry younger than the threshold must NOT block trading -
+    this is a hard age cutoff (trading resumes once the entry ages back below
+    threshold or reconciles), not a permanent block until reconciled."""
+    config = RiskConfig(account_equity=10000.0, max_unconfirmed_pnl_age_minutes=15.0)
+    manager = RiskManager(config)
+
+    pending_pnl = {
+        123: {"symbol": "EURUSD", "reason": "SL hit", "queued_at": datetime.now() - timedelta(minutes=5), "attempts": 1}
+    }
+
+    result = manager.can_open_trade('GBPUSD', 0.1, {}, pending_pnl)
+    assert result['valid'] is True
+
+
+def test_can_open_trade_ignores_empty_pending_pnl():
+    """Existing circuit-breaker behavior must be unchanged when pending_pnl is
+    omitted or empty - proves the new parameter is backward compatible."""
+    config = RiskConfig(account_equity=10000.0)
+    manager = RiskManager(config)
+
+    assert manager.can_open_trade('EURUSD', 0.1, {})['valid'] is True
+    assert manager.can_open_trade('EURUSD', 0.1, {}, {})['valid'] is True
+    assert manager.can_open_trade('EURUSD', 0.1, {}, None)['valid'] is True
+
 
 def test_validate_trade_setup():
     """Test Reward-to-Risk ratio validation"""

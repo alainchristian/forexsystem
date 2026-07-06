@@ -1,13 +1,14 @@
 import numpy as np
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 
 from config.config import (
     SYMBOLS, MIN_REPLACEMENT_HOLD_MINUTES, MIN_REPLACEMENT_CONFIDENCE_GAP,
     MIN_REPLACEMENT_PROFIT, RISK_KELLY_MULTIPLIER_MIN, RISK_KELLY_MULTIPLIER_MAX,
+    MAX_UNCONFIRMED_PNL_AGE_MINUTES,
 )
-from src.execution_logic import calculate_kelly_fraction
+from src.execution_logic import calculate_kelly_fraction, dollar_per_pip_per_lot
 
 @dataclass
 class RiskConfig:
@@ -22,14 +23,23 @@ class RiskConfig:
     min_replacement_hold_minutes: float = MIN_REPLACEMENT_HOLD_MINUTES
     min_replacement_confidence_gap: float = MIN_REPLACEMENT_CONFIDENCE_GAP
     min_replacement_profit: float = MIN_REPLACEMENT_PROFIT
+    max_unconfirmed_pnl_age_minutes: float = MAX_UNCONFIRMED_PNL_AGE_MINUTES
 
 class RiskManager:
-    def __init__(self, config: RiskConfig):
+    def __init__(self, config: RiskConfig,
+                 on_state_changed: Optional[Callable[[float, float], None]] = None):
+        """on_state_changed(peak_equity, daily_pnl), if given, is invoked whenever
+        either value changes (update_daily_pnl, reset_daily_stats) so a caller can
+        persist them across restarts (see main.py / src/risk_state.py). Left as an
+        injected hook rather than importing persistence directly here so RiskManager
+        stays DB-free and every existing bare-construction test keeps working
+        unchanged."""
         self.config = config
         self.open_trades = []
         self.daily_pnl = 0.0
         self.peak_equity = config.account_equity
         self.session_start_time = datetime.now()
+        self.on_state_changed = on_state_changed
     
     def calculate_position_size(self,
                                entry_price: float,
@@ -49,13 +59,7 @@ class RiskManager:
         if risk_pips <= 0:
             return 0.0
 
-        # Dollar value of 1 pip for 1 standard lot (100,000 units)
-        # JPY pairs: quote currency is JPY — convert via current price
-        # All other pairs tracked here are USD-quoted: flat $10/pip/lot
-        if pip_value == 0.01:  # JPY pairs (USDJPY, EURJPY, GBPJPY)
-            dollar_per_pip = (pip_value / entry_price) * 100_000
-        else:
-            dollar_per_pip = 10.0
+        dollar_per_pip = dollar_per_pip_per_lot(pip_value, entry_price)
 
         position_size = risk_dollars / (risk_pips * dollar_per_pip)
         
@@ -78,7 +82,7 @@ class RiskManager:
         
         # Constraint: never risk more than 5% per trade absolute
         max_risk_dollars = self.config.account_equity * 0.05
-        max_position = max_risk_dollars / (risk_pips * 10)
+        max_position = max_risk_dollars / (risk_pips * dollar_per_pip)
         position_size = min(position_size, max_position)
 
         # Clamp to symbol-specific max lot size
@@ -88,8 +92,22 @@ class RiskManager:
 
         return round(max(0.01, position_size), 2)
     
-    def can_open_trade(self, symbol: str, volume: float, open_positions: dict) -> dict:
+    def can_open_trade(self, symbol: str, volume: float, open_positions: dict,
+                       pending_pnl: Optional[dict] = None) -> dict:
         """Check if we can open a new trade based on circuit breakers and limits"""
+        # Unconfirmed P&L breaker: daily_pnl/peak_equity below are unreliable
+        # while a close is still unreconciled (see mt5_trader.queue_pnl_reconciliation).
+        # Hard-blocks new trades once any entry has been stuck longer than
+        # max_unconfirmed_pnl_age_minutes, on top of (not instead of) the
+        # existing Telegram alert escalation in reconcile_pending_pnl.
+        if pending_pnl:
+            oldest_age_minutes = max(
+                (datetime.now() - entry['queued_at']).total_seconds() / 60
+                for entry in pending_pnl.values()
+            )
+            if oldest_age_minutes >= self.config.max_unconfirmed_pnl_age_minutes:
+                return {'valid': False, 'reason': 'Unconfirmed P&L pending reconciliation'}
+
         # Daily loss limit breaker
         if self.daily_pnl < -self.config.account_equity * self.config.max_daily_loss_pct:
             return {'valid': False, 'reason': 'Daily loss limit reached'}
@@ -138,8 +156,12 @@ class RiskManager:
         self.daily_pnl += closed_trade_pnl
         self.config.account_equity += closed_trade_pnl
         self.peak_equity = max(self.peak_equity, self.config.account_equity)
-    
+        if self.on_state_changed:
+            self.on_state_changed(self.peak_equity, self.daily_pnl)
+
     def reset_daily_stats(self):
         """Reset at session end (e.g., 5PM ET)"""
         self.daily_pnl = 0.0
         self.session_start_time = datetime.now()
+        if self.on_state_changed:
+            self.on_state_changed(self.peak_equity, self.daily_pnl)
