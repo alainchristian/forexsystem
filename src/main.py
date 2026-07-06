@@ -31,14 +31,24 @@ from src.models.xgboost_classifier import XGBoostSignal
 from src.models.ensemble import EnsembleStrategy
 from src.features import load_scaler
 
-logging.config.dictConfig(cfg.LOGGING)
-logger = logging.getLogger('Main')
+def _configure_logging() -> None:
+    """Attach the file/console handlers from config.config.LOGGING to the
+    root logger. Deferred to the real entry point (guarded by
+    `if __name__ == '__main__'` below) rather than run as an import-time
+    side effect - importing this module just for its classes (e.g. from a
+    test suite building a TradingSystem/MT5Trader) used to redirect real
+    log output into the live logs/forex_system.log file, since MT5Trader's
+    own logger propagates to the root logger this configures."""
+    logging.config.dictConfig(cfg.LOGGING)
 
-# Suppress noisy third-party debug output that contains emoji and
-# causes UnicodeEncodeError on Windows cp1252 consoles
-logging.getLogger('telegram').setLevel(logging.WARNING)
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
+    # Suppress noisy third-party debug output that contains emoji and
+    # causes UnicodeEncodeError on Windows cp1252 consoles
+    logging.getLogger('telegram').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+
+
+logger = logging.getLogger('Main')
 
 
 class TradingSystem:
@@ -629,4 +639,5 @@ async def main():
 
 
 if __name__ == '__main__':
+    _configure_logging()
     asyncio.run(main())
