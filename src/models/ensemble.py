@@ -24,19 +24,24 @@ class EnsembleStrategy:
         self.xgb = xgboost_signal
         self.threshold = threshold_confidence
         
-    def generate_signal(self, recent_data: np.ndarray, current_price: float) -> Tuple[int, float]:
+    def generate_signal(self, recent_data: np.ndarray, current_price: float, symbol: str = "") -> Tuple[int, float]:
         """
         Generates an ensemble signal.
         Args:
-            recent_data: NumPy array of shape (lookback, num_features) for LSTM. 
+            recent_data: NumPy array of shape (lookback, num_features) for LSTM.
                          The last row is used for XGBoost.
             current_price: Current close price to compare against LSTM prediction.
-            
+            symbol: Trading pair, included in log messages so a symbol can be
+                    identified without cross-referencing the caller's own log
+                    line. Optional (defaults to no prefix) since backtest/
+                    walk-forward callers don't track a symbol per call.
+
         Returns:
-            (signal, confidence): 
+            (signal, confidence):
             signal is 1 (Long), -1 (Short), or 0 (Flat)
             confidence is [0.0, 1.0]
         """
+        prefix = f"{symbol}: " if symbol else ""
         # 1. LSTM Signal
         try:
             # train_models.py trains this model on pct_change targets, not
@@ -60,7 +65,7 @@ class EnsembleStrategy:
             # Cap strength at 1.0 based on a 0.5% move expectation
             lstm_strength = min(abs(lstm_pred_pct_change) / 0.005, 1.0)
         except Exception as e:
-            logger.warning(f"LSTM prediction failed: {e}")
+            logger.warning(f"{prefix}LSTM prediction failed: {e}")
             lstm_signal = 0
             lstm_strength = 0.0
 
@@ -77,7 +82,7 @@ class EnsembleStrategy:
             else:
                 xgb_conf = probas[1]
         except Exception as e:
-            logger.warning(f"XGBoost prediction failed: {e}")
+            logger.warning(f"{prefix}XGBoost prediction failed: {e}")
             xgb_signal = 0
             xgb_conf = 0.0
 
@@ -85,7 +90,7 @@ class EnsembleStrategy:
         lstm_dir = {1: "BUY", -1: "SELL", 0: "FLAT"}[lstm_signal]
         xgb_dir  = {1: "BUY", -1: "SELL", 0: "FLAT"}[xgb_signal]
         logger.info(
-            f"LSTM: {lstm_dir} (strength={lstm_strength:.3f})  "
+            f"{prefix}LSTM: {lstm_dir} (strength={lstm_strength:.3f})  "
             f"XGB: {xgb_dir} (conf={xgb_conf:.3f})  threshold={self.threshold:.2f}"
         )
 
@@ -96,18 +101,18 @@ class EnsembleStrategy:
         #    to make once its live signal quality has been validated.
         #    Fire when XGBoost picks a directional class above the threshold.
         if xgb_signal == 0:
-            logger.info("No signal: XGBoost returned FLAT")
+            logger.info(f"{prefix}No signal: XGBoost returned FLAT")
             return 0, xgb_conf
 
         if xgb_conf < self.threshold:
             logger.info(
-                f"XGB {xgb_dir} signal blocked by confidence filter: "
+                f"{prefix}XGB {xgb_dir} signal blocked by confidence filter: "
                 f"{xgb_conf:.3f} < {self.threshold:.2f}"
             )
             return 0, xgb_conf
 
         lstm_note = f"LSTM={lstm_dir}" if lstm_signal == xgb_signal else f"LSTM={lstm_dir} (disagrees)"
-        logger.info(f"XGB {xgb_dir} signal confirmed at {xgb_conf:.3f} | {lstm_note}")
+        logger.info(f"{prefix}XGB {xgb_dir} signal confirmed at {xgb_conf:.3f} | {lstm_note}")
         return xgb_signal, xgb_conf
         
     def backtest_ensemble(self, df: pd.DataFrame, features_df: pd.DataFrame) -> Dict:

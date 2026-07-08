@@ -237,7 +237,7 @@ class MT5Trader:
                 else:
                     profit_str = "unknown" if current_profit is None else f"${current_profit:+.2f}"
                     self.logger.warning(
-                        f"Trade blocked: {trade_check['reason']} (replacement rejected for #{lowest_id} — "
+                        f"{symbol}: Trade blocked: {trade_check['reason']} (replacement rejected for #{lowest_id} — "
                         f"hold {hold_minutes:.1f}/{self.risk_mgr.config.min_replacement_hold_minutes:.1f}min, "
                         f"confidence gap {confidence_gap:.2f}/{self.risk_mgr.config.min_replacement_confidence_gap:.2f}, "
                         f"profit {profit_str}"
@@ -245,7 +245,7 @@ class MT5Trader:
                     )
                     return None
             else:
-                self.logger.warning(f"Trade blocked: {trade_check['reason']}")
+                self.logger.warning(f"{symbol}: Trade blocked: {trade_check['reason']}")
                 # Per-symbol/volume caps are routine and fire repeatedly
                 # whenever a symbol that already has a position keeps
                 # generating signals - alerting on every occurrence just
@@ -258,7 +258,7 @@ class MT5Trader:
 
         validation = self.risk_mgr.validate_trade_setup(entry_price, stop_loss, take_profit)
         if not validation["valid"]:
-            self.logger.warning(f"Invalid setup: {validation['reason']}")
+            self.logger.warning(f"{symbol}: Invalid setup: {validation['reason']}")
             return None
 
         # --- Spread check ---
@@ -288,14 +288,14 @@ class MT5Trader:
                 margin_req = mt5.order_calc_margin(order_type, symbol, float(volume), float(entry_price))
                 if margin_req and margin_req > acc.margin_free * 0.8:
                     safe_vol = round(max(0.01, float(volume) * (acc.margin_free * 0.8 / margin_req)), 2)
-                    self.logger.warning(f"Volume reduced {volume}→{safe_vol} (margin)")
+                    self.logger.warning(f"{symbol}: Volume reduced {volume}→{safe_vol} (margin)")
                     volume = safe_vol
         else:
             acc_data = self._bridge_account()
             if acc_data:
                 free = acc_data.get("free_margin", 999999)
                 if free < 50:
-                    self.logger.warning(f"Low free margin ({free:.2f}), skipping")
+                    self.logger.warning(f"{symbol}: Low free margin ({free:.2f}), skipping")
                     return None
 
         # --- Send order ---
@@ -316,7 +316,7 @@ class MT5Trader:
             result = await self._bridge_wait_result(sig_id)
             if result is None or result.get("status") != "OK":
                 err = result.get("error", "timeout") if result else "timeout"
-                self.logger.error(f"Bridge order failed: {err}")
+                self.logger.error(f"{symbol}: Bridge order failed: {err}")
                 await self.telegram.send_alert(f"❌ Order failed ({symbol}): {err}")
                 return None
             order_id = int(result["ticket"])
@@ -338,8 +338,8 @@ class MT5Trader:
             }
             res = mt5.order_send(request)
             if res.retcode != mt5.TRADE_RETCODE_DONE:
-                self.logger.error(f"Order failed: {res.comment}")
-                await self.telegram.send_alert(f"❌ Order failed: {res.comment}")
+                self.logger.error(f"{symbol}: Order failed: {res.comment}")
+                await self.telegram.send_alert(f"❌ Order failed ({symbol}): {res.comment}")
                 return None
             order_id = res.order
 

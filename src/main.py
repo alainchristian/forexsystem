@@ -496,7 +496,7 @@ class TradingSystem:
             recent_data = fe.features_normalized.iloc[-60:].values
             current_price = df['close'].iloc[-1]
 
-            signal, confidence = self.ensemble.generate_signal(recent_data, current_price)
+            signal, confidence = self.ensemble.generate_signal(recent_data, current_price, symbol=symbol)
 
             dir_label = {1: "BUY", -1: "SELL", 0: "NEUTRAL"}[signal]
             logger.info(f"{symbol}: Ensemble -> {dir_label} | confidence: {confidence:.2%}")
