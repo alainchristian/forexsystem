@@ -132,13 +132,16 @@ class RiskManager:
         
         return {'valid': True, 'reason': 'OK'}
     
-    def validate_trade_setup(self, 
-                            entry_price: float, 
-                            stop_loss: float, 
-                            take_profit: float) -> dict:
+    def validate_trade_setup(self,
+                            entry_price: float,
+                            stop_loss: float,
+                            take_profit: float,
+                            symbol: Optional[str] = None) -> dict:
         """Check R:R ratio and other trade quality metrics"""
-        risk_pips = abs(entry_price - stop_loss) * 10000
-        reward_pips = abs(take_profit - entry_price) * 10000
+        # Use symbol's pip_value so JPY pairs (pip=0.01) are counted correctly
+        pip_value = SYMBOLS[symbol]['pip_value'] if symbol and symbol in SYMBOLS else 0.0001
+        risk_pips = abs(entry_price - stop_loss) / pip_value
+        reward_pips = abs(take_profit - entry_price) / pip_value
         
         ratio = round(reward_pips / (risk_pips + 1e-6), 2)
         

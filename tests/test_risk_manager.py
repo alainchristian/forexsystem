@@ -193,3 +193,37 @@ def test_validate_trade_setup():
     res_bad = manager.validate_trade_setup(entry_price=1.0500, stop_loss=1.0480, take_profit=1.0520)
     assert res_bad['valid'] is False
     assert res_bad['ratio'] == pytest.approx(1.0)
+
+def test_validate_trade_setup_uses_symbol_pip_value_for_jpy_pairs():
+    """USDJPY's pip_value is 0.01, not the 0.0001 default - risk_pips/reward_pips
+    must be computed with the symbol's real pip size, not a hardcoded *10000,
+    or these raw fields are silently off by ~100x for JPY pairs (the ratio
+    happened to cancel the old constant out, but the raw pip counts didn't)."""
+    config = RiskConfig(account_equity=10000.0, min_reward_risk_ratio=1.5)
+    manager = RiskManager(config)
+
+    # Risk 0.20 price units = 20 pips at pip_value=0.01; reward 0.40 = 40 pips
+    res = manager.validate_trade_setup(
+        entry_price=150.00, stop_loss=149.80, take_profit=150.40, symbol='USDJPY'
+    )
+    assert res['risk_pips'] == pytest.approx(20.0)
+    assert res['reward_pips'] == pytest.approx(40.0)
+    assert res['ratio'] == pytest.approx(2.0)
+    assert res['valid'] is True
+
+def test_validate_trade_setup_falls_back_to_default_pip_value_without_symbol():
+    """No symbol (or an unknown one) must fall back to the same 0.0001 default
+    calculate_position_size uses, so existing callers that don't pass a symbol
+    keep getting today's non-JPY behavior."""
+    config = RiskConfig(account_equity=10000.0, min_reward_risk_ratio=1.5)
+    manager = RiskManager(config)
+
+    res_no_symbol = manager.validate_trade_setup(entry_price=1.0500, stop_loss=1.0480, take_profit=1.0540)
+    assert res_no_symbol['risk_pips'] == pytest.approx(20.0)
+    assert res_no_symbol['reward_pips'] == pytest.approx(40.0)
+
+    res_unknown_symbol = manager.validate_trade_setup(
+        entry_price=1.0500, stop_loss=1.0480, take_profit=1.0540, symbol='NOTASYMBOL'
+    )
+    assert res_unknown_symbol['risk_pips'] == pytest.approx(20.0)
+    assert res_unknown_symbol['reward_pips'] == pytest.approx(40.0)

@@ -256,7 +256,7 @@ class MT5Trader:
                     await self.telegram.send_alert(f"⛔ Trade blocked: {trade_check['reason']}")
                 return None
 
-        validation = self.risk_mgr.validate_trade_setup(entry_price, stop_loss, take_profit)
+        validation = self.risk_mgr.validate_trade_setup(entry_price, stop_loss, take_profit, symbol=symbol)
         if not validation["valid"]:
             self.logger.warning(f"{symbol}: Invalid setup: {validation['reason']}")
             return None
