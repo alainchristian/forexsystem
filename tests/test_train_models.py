@@ -53,8 +53,9 @@ class _FakeXGB:
         self.prepare_labels_calls.append(len(df))
         return np.zeros(len(df))
 
-    def train(self, X, y, cv_folds, feature_names):
+    def train(self, X, y, cv_folds, feature_names, groups=None, embargo=None):
         self.trained_on_shape = X.shape
+        self.groups = groups
         return {'accuracy': 0.5, 'precision': 0.5}
 
 
@@ -137,4 +138,8 @@ def test_train_xgboost_labels_each_symbol_independently():
 
     assert fake.prepare_labels_calls == [50, 80]
     assert metrics == {'accuracy': 0.5, 'precision': 0.5}
+    # One group id per symbol, so the CV split can walk forward in time
+    # within each symbol independently instead of treating a later row in
+    # the concatenated array as "the future" of an unrelated symbol.
+    assert np.array_equal(fake.groups, np.concatenate([np.full(50, 0), np.full(80, 1)]))
     assert fake.trained_on_shape[0] == 130  # 50 + 80 rows combined

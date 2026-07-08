@@ -88,6 +88,45 @@ def test_xgboost_feature_importance(sample_data):
     # Our mocked data made feat_0 highly correlated
     assert importance_df.iloc[0]['Feature'] == 'feat_0'
 
+def test_purged_group_splits_respects_group_order_and_embargo():
+    """Each fold's validation rows must come strictly after that fold's
+    training rows within their own group, and no training row within
+    `embargo` rows of the validation cut should survive purging - otherwise
+    a label's lookahead window (built from future closes) could leak across
+    the train/validation boundary."""
+    model = XGBoostSignal()
+    # Two groups (e.g. two symbols), each with its own contiguous index range.
+    groups = np.array([0] * 60 + [1] * 90)
+    embargo = 5
+
+    folds = list(model._purged_group_splits(groups, n_splits=3, embargo=embargo))
+    assert len(folds) == 3
+
+    for train_idx, val_idx in folds:
+        for g in np.unique(groups):
+            g_train = train_idx[groups[train_idx] == g]
+            g_val = val_idx[groups[val_idx] == g]
+            if len(g_train) == 0 or len(g_val) == 0:
+                continue
+            # Every validation row in this group must be later (higher
+            # original index) than every training row in the same group.
+            assert g_train.max() < g_val.min()
+            # The embargo gap must have actually purged the rows
+            # immediately preceding the validation cut.
+            assert g_val.min() - g_train.max() > embargo
+
+
+def test_purged_group_splits_treats_ungrouped_data_as_one_series():
+    """Without an explicit groups array, train() defaults to a single group
+    so the whole X/y is treated as one chronological series."""
+    model = XGBoostSignal()
+    groups = np.zeros(100, dtype=int)
+    folds = list(model._purged_group_splits(groups, n_splits=4, embargo=3))
+    assert len(folds) == 4
+    for train_idx, val_idx in folds:
+        assert train_idx.max() < val_idx.min()
+
+
 def test_xgboost_save_load(sample_data, tmp_path):
     df, features_df = sample_data
     model = XGBoostSignal()

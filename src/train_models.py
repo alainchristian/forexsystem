@@ -85,15 +85,25 @@ def train_xgboost(xgb: XGBoostSignal, per_symbol_dfs: list, per_symbol_features:
     threshold_pct=0.002 (0.2%) labels more bars as directional vs the old 0.5%,
     fixing the class imbalance that caused XGBoost to always predict FLAT.
     """
-    label_parts = [xgb.prepare_labels(df, lookahead=5, threshold_pct=0.002) for df in per_symbol_dfs]
+    lookahead = 5
+    label_parts = [xgb.prepare_labels(df, lookahead=lookahead, threshold_pct=0.002) for df in per_symbol_dfs]
     labels = np.concatenate(label_parts)
     features_df = pd.concat(per_symbol_features, ignore_index=True)
     X = features_df.values
 
+    # One group id per symbol so the CV split walks forward in time
+    # independently within each symbol before combining fold-by-fold - a
+    # later row in this concatenated array is a different symbol, covering
+    # roughly the same calendar range, not literally a later timestamp.
+    groups = np.concatenate([np.full(len(df), i) for i, df in enumerate(per_symbol_dfs)])
+
     logger.info(f"XGBoost training - {X.shape[0]} samples, {X.shape[1]} features")
     counts = {-1: (labels == -1).sum(), 0: (labels == 0).sum(), 1: (labels == 1).sum()}
     logger.info(f"Label distribution - SELL: {counts[-1]}, FLAT: {counts[0]}, BUY: {counts[1]}")
-    metrics = xgb.train(X, labels, cv_folds=3, feature_names=list(features_df.columns))
+    metrics = xgb.train(
+        X, labels, cv_folds=3, feature_names=list(features_df.columns),
+        groups=groups, embargo=lookahead,
+    )
     logger.info(f"XGBoost CV - accuracy: {metrics['accuracy']:.4f}, precision: {metrics['precision']:.4f}")
     return metrics
 
