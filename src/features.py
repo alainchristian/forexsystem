@@ -541,7 +541,7 @@ if __name__ == '__main__':
     print("=" * 60)
     
     # Create dummy OHLCV data
-    dates = pd.date_range(start='2023-01-01', periods=500, freq='4H')
+    dates = pd.date_range(start='2023-01-01', periods=500, freq='4h')
     np.random.seed(42)
     close = 1.0500 + np.cumsum(np.random.randn(500) * 0.0005)
     

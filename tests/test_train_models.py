@@ -11,7 +11,7 @@ from src.train_models import train_lstm, train_xgboost
 
 
 def _make_symbol_df(base_price, n):
-    dates = pd.date_range('2023-01-01', periods=n, freq='4H')
+    dates = pd.date_range('2023-01-01', periods=n, freq='4h')
     close = base_price + np.cumsum(np.random.default_rng(int(base_price)).normal(0, base_price * 0.001, n))
     return pd.DataFrame({'timestamp': dates, 'close': close})
 

@@ -12,7 +12,7 @@ from src.models.lstm_predictor import LSTMPredictor
 
 @pytest.fixture
 def sample_data():
-    dates = pd.date_range(start='2023-01-01', periods=200, freq='4H')
+    dates = pd.date_range(start='2023-01-01', periods=200, freq='4h')
     np.random.seed(42)
     close = 1.0500 + np.cumsum(np.random.randn(200) * 0.001)
     
@@ -93,7 +93,7 @@ def test_lstm_mae_target():
     Test that MAE < 0.05% on a properly generated linear sequence
     """
     # Create sine wave data so model can learn it easily and doesn't have to extrapolate
-    dates = pd.date_range(start='2023-01-01', periods=1000, freq='4H')
+    dates = pd.date_range(start='2023-01-01', periods=1000, freq='4h')
     x = np.linspace(0, 20 * np.pi, 1000)
     close = 1.25 + 0.25 * np.sin(x)  # Values between 1.0 and 1.5
     
